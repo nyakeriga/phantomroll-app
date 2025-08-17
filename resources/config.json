@@ -1,1 +1,33 @@
-{"groups": ["{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","{","groups",":","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}","}"]}
+{
+  "api_id": 24238991,
+  "api_hash": "d5e8a9523c901ae20c36208effd9909f",
+  "phone_number": "+13522070047",
+  "system_language_code": "en",
+  "device_model": "PhantomRoll-Win",
+  "system_version": "10",
+  "application_version": "1.0",
+  "database_directory": "./tdlib-data",
+  "files_directory": "./td_files",
+  "use_test_dc": false,
+  "use_file_database": false,
+  "use_message_database": false,
+  "use_secret_chats": false,
+  "enable_storage_optimizer": true,
+  "test_mode": false,
+  "dice_settings": {
+    "🎲": {
+      "delete_delay_ms": 5,
+      "interval_ms": 1000,
+      "target": 3
+    }
+  },
+  "private_dice_group_id": -1002700319033,
+  "groups": [
+    {
+      "id": -1002707554358,
+      "interval_ms": 1000,
+      "name": "公群12 · 押2888U 小李扫雷公群"
+    }
+  ],
+  "valid_sums": [3, 5, 7, 9, 11, 13, 15, 17]
+}
