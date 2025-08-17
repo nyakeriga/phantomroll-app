@@ -1,30 +1,33 @@
-#ifndef PHANTOMROLL_SOCKET_SERVER_HPP
-#define PHANTOMROLL_SOCKET_SERVER_HPP
+#ifndef SOCKET_SERVER_HPP
+#define SOCKET_SERVER_HPP
 
-#include <string>
 #include <thread>
 #include <functional>
-#include <atomic>
+#include <memory>
+#include <string>
+
+class Logger;
 
 class SocketServer {
 public:
-    explicit SocketServer(int port);
+    SocketServer(int port, std::shared_ptr<Logger> logger);
     ~SocketServer();
 
+    void start();
     void start(std::function<void(const std::string&)> handler);
     void stop();
 
 private:
-    void run();
-    void handle_client(int client_socket);
+    void run_socket();
+    void run_internal();
+    void run_external(std::function<void(const std::string&)> handler);
+    std::string handle_command(const std::string& cmdline);
 
-private:
     int port_;
-    int server_fd_;
-    std::atomic<bool> running_;
+    std::shared_ptr<Logger> logger_;
+    bool running_;
     std::thread server_thread_;
-    std::function<void(const std::string&)> command_handler_;
 };
 
-#endif // PHANTOMROLL_SOCKET_SERVER_HPP
+#endif // SOCKET_SERVER_HPP
 
