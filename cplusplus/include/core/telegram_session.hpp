@@ -1,32 +1,32 @@
-#pragma once
+#ifndef SOCKET_SERVER_HPP
+#define SOCKET_SERVER_HPP
 
+#include <thread>
+#include <functional>
+#include <memory>
 #include <string>
-#include <mutex>
-#include <td/telegram/td_json_client.h>
-#include "nlohmann/json.hpp"
 
-class TelegramSession {
+class Logger;
+
+class SocketServer {
 public:
-    static TelegramSession& get_instance();
+    SocketServer(int port, std::shared_ptr<Logger> logger);
+    ~SocketServer();
 
-    void initialize(const nlohmann::json& config);
-    void authenticate();
-    void send(const std::string& request);
-    std::string receive(double timeout = 1.0);
-    void close();
-    bool is_authorized() const;
-    void set_session_suffix(const std::string& suffix);
-    void reset_session_files();  // ✅ ADDED
-
-    int64_t get_own_user_id();   // ✅ NEW: Needed for aggressive delete fallback
+    void start();
+    void start(std::function<void(const std::string&)> handler);
+    void stop();
 
 private:
-    TelegramSession();
-    ~TelegramSession();
+    void run_socket();
+    void run_internal();
+    void run_external(std::function<void(const std::string&)> handler);
+    std::string handle_command(const std::string& cmdline);
 
-    void *client_;
-    std::mutex client_mutex_;
-    nlohmann::json config_;
-    bool authorized_;
-    std::string session_suffix_;
+    int port_;
+    std::shared_ptr<Logger> logger_;
+    bool running_;
+    std::thread server_thread_;
 };
+
+#endif // SOCKET_SERVER_HPP
