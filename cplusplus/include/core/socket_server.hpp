@@ -5,28 +5,39 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <atomic>
 
 class Logger;
 
 class SocketServer {
 public:
-    SocketServer(int port, std::shared_ptr<Logger> logger);
+    explicit SocketServer(int port, std::shared_ptr<Logger> logger);
     ~SocketServer();
 
+    // non-copyable
+    SocketServer(const SocketServer&) = delete;
+    SocketServer& operator=(const SocketServer&) = delete;
+
+    // Start server with default handler
     void start();
+    // Start server with custom handler
     void start(std::function<void(const std::string&)> handler);
+
     void stop();
 
 private:
-    void run_socket();
-    void run_internal();
-    void run_external(std::function<void(const std::string&)> handler);
-    std::string handle_command(const std::string& cmdline);
+    void run(); // Main server loop
+    void handle_client(int client_socket); // Handle a client connection
+    std::string process_command(const std::string& cmd); // Process a command
 
-    int port_;
+    int port_{};
     std::shared_ptr<Logger> logger_;
-    bool running_;
+    std::atomic<bool> running_{false};
+    int server_fd_{-1}; // Server socket file descriptor
     std::thread server_thread_;
+
+    // Missing declaration added: store optional external handler provided via start(handler)
+    std::function<void(const std::string&)> external_handler_;
 };
 
 #endif // SOCKET_SERVER_HPP
