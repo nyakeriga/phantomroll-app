@@ -1,3 +1,4 @@
+// ...existing code...
 #ifndef CORE_MESSAGE_HANDLER_HPP
 #define CORE_MESSAGE_HANDLER_HPP
 
@@ -7,6 +8,9 @@
 #include <unordered_map>
 #include <set>
 #include <cstdint>
+#include <optional>
+#include <mutex>
+#include "core/bot_types.hpp"
 #include "core/telegram_session.hpp"
 
 class MessageHandler {
@@ -37,6 +41,14 @@ public:
 
     // Set the public group ID (string form) for publishing dice results
     void set_public_group_id(const std::string& group_id);
+
+    // Pick best triple (for use with dice logic)
+    std::optional<std::tuple<int,int,int>> pick_best_triple(const std::array<int,10>& dice_values) const;
+
+    // Control APIs invoked by control server
+    void start_login(const std::string& phone);
+    void logout();
+    void add_group_by_name(const std::string& group);
 
 private:
     // Loop: send dice, filter bad rolls, delete unwanted messages
@@ -78,8 +90,16 @@ private:
     int dice_result_timeout_ms_ = 1500;
     std::set<int> allowed_sums_;
     int64_t public_group_id_ = 0;
-    bool running_ = true;
-};
 
-#endif // CORE_MESSAGE_HANDLER_HPP
+    // running flag (made atomic for thread-safety)
+    std::atomic<bool> running_{true};
+
+    // mutex to protect config_ and group_name_to_id_ when modified at runtime
+    std::mutex state_mutex_;
+
+    // If you need to store group/dice settings
+    std::vector<GroupInfo> public_groups_;
+    std::unordered_map<std::string, DiceSetting> dice_settings_;
+
+};
 
