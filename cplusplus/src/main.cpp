@@ -1,3 +1,4 @@
+// ...existing code...
 #include <iostream>
 #include <csignal>
 #include <cstdlib>
@@ -6,9 +7,11 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <atomic>
 #include "core/telegram_session.hpp"
 #include "core/message_handler.hpp"
 #include "core/socket_server.hpp"
+#include "core/logger.hpp"
 #include "nlohmann/json.hpp"
 
 // TDLib wrappers
@@ -31,31 +34,21 @@ namespace utils {
 using json = nlohmann::json;
 
 // Global pointers for graceful shutdown
-static SocketServer* g_control_server = nullptr;
-static MessageHandler* g_handler = nullptr;
+// changed to non-static so other translation units can reference via `extern`
+SocketServer* g_control_server = nullptr;
+MessageHandler* g_handler = nullptr;
 
-static void signal_handler(int signal) {
-    std::cerr << "\n[INFO] Termination signal (" << signal << ") received. Shutting down PhantomRoll..." << std::endl;
+// Atomic running flag used across threads and signal handler
+static std::atomic<bool> running{true};
 
-    // Stop Telegram session
-    TelegramSession::get_instance().close();
-
-    // Stop control server if running
-    if (g_control_server) {
-        g_control_server->stop();
-    }
-
-    // Stop handler if running
-    if (g_handler) {
-        g_handler->stop(); // You must ensure MessageHandler has stop() method
-    }
-
-    std::exit(signal);
+// Minimal, signal-safe handler: flip running flag
+static void signal_handler(int /*signal*/) {
+    running = false;
 }
 
 void start_heartbeat() {
     std::thread([] {
-        while (true) {
+        while (running.load()) {
             std::this_thread::sleep_for(std::chrono::seconds(60));
             std::time_t now = std::time(nullptr);
             std::cout << "[HEARTBEAT] PhantomRoll alive at " << std::ctime(&now);
@@ -97,6 +90,7 @@ int main(int argc, char* argv[]) {
     std::cout << "║  PhantomRoll - Stealth Telegram Dice Bot   ║\n";
     std::cout << "╚══════════════════════════════════════════════╝\n";
 
+    // register minimal signal handler
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
@@ -129,37 +123,74 @@ int main(int argc, char* argv[]) {
         std::cout << "[INFO] Control server running on port 8879\n";
 
         // Authentication thread
-        std::thread auth_thread([&]() { session.authenticate(); });
+        std::thread auth_thread([&]() {
+            try {
+                session.authenticate();
+            } catch (const std::exception& e) {
+                std::cerr << "[ERROR] auth_thread exception: " << e.what() << std::endl;
+                running = false;
+            } catch (...) {
+                std::cerr << "[ERROR] auth_thread unknown exception\n";
+                running = false;
+            }
+        });
 
-        while (!session.is_authorized()) {
+        // Wait for authentication (allow external interruption via running flag)
+        while (!session.is_authorized() && running.load()) {
             std::string input;
             std::cout << "Enter login code / 2FA (or 'exit'): ";
-            std::getline(std::cin, input);
+            if (!std::getline(std::cin, input)) {
+                // EOF or error on stdin -> trigger shutdown
+                running = false;
+                break;
+            }
             if (input == "exit") {
+                running = false;
                 session.close();
-                auth_thread.join();
-                return EXIT_SUCCESS;
+                break;
             }
             if (session.is_waiting_for_code()) session.submit_code_async(input);
             else if (session.is_waiting_for_password()) session.submit_2fa_async(input);
         }
 
-        auth_thread.join();
+        // Ensure auth thread finished
+        if (auth_thread.joinable()) auth_thread.join();
+
+        if (!running.load()) {
+            // graceful early shutdown
+            if (g_control_server) g_control_server->stop();
+            if (g_handler) g_handler->stop();
+            if (&session) session.close();
+            std::cout << "[INFO] Shutdown requested before full auth, exiting.\n";
+            return EXIT_SUCCESS;
+        }
+
         std::cout << "[INFO] Authenticated successfully.\n";
 
+        // Start handler loop in separate thread
         std::thread handler_thread([&handler]() { handler.run(); });
 
         start_heartbeat();
 
-        while (session.is_authorized()) std::this_thread::sleep_for(std::chrono::seconds(60));
+        // Main wait loop: exit when running==false or session no longer authorized
+        while (session.is_authorized() && running.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
 
-        handler_thread.join();
+        // Initiate shutdown sequence
+        std::cerr << "[INFO] Initiating graceful shutdown...\n";
+        if (g_control_server) g_control_server->stop();
+        if (g_handler) g_handler->stop();
+        session.close();
+
+        if (handler_thread.joinable()) handler_thread.join();
 
     } catch (const std::exception& e) {
         std::cerr << "[FATAL] " << e.what() << "\n";
         return EXIT_FAILURE;
     }
 
+    std::cout << "[INFO] PhantomRoll stopped.\n";
     return 0;
-}
-
+} // main
+// End of main.cpp  -------
