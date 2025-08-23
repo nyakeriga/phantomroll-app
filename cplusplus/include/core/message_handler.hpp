@@ -1,7 +1,6 @@
-// ...existing code...
+// message_handler.hpp
 #ifndef CORE_MESSAGE_HANDLER_HPP
 #define CORE_MESSAGE_HANDLER_HPP
-
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -12,12 +11,10 @@
 #include <mutex>
 #include "core/bot_types.hpp"
 #include "core/telegram_session.hpp"
-
 class MessageHandler {
 public:
     // Construct with a TelegramSession reference and config JSON
     MessageHandler(TelegramSession& session, const nlohmann::json& config);
-
     // Main blocking processing loop
     void run();
 
@@ -49,11 +46,12 @@ public:
     void start_login(const std::string& phone);
     void logout();
     void add_group_by_name(const std::string& group);
-
+    void submit_code(const std::string& code);
+    void submit_password(const std::string& password);
+    void get_status(nlohmann::json& resp);
 private:
     // Loop: send dice, filter bad rolls, delete unwanted messages
     void send_dice_and_delete_loop();
-
     // Construct the message payload for sending a dice roll
     std::string build_dice_message(const std::string& emoji, int64_t chat_id);
 
@@ -71,11 +69,9 @@ private:
 
     // Check if the bot/account has access to a given group
     bool has_group_access(int64_t chat_id);
-
 private:
     TelegramSession& session_;
     nlohmann::json config_;
-
     // Group name -> chat ID cache
     std::unordered_map<std::string, int64_t> group_name_to_id_;
 
@@ -100,6 +96,5 @@ private:
     // If you need to store group/dice settings
     std::vector<GroupInfo> public_groups_;
     std::unordered_map<std::string, DiceSetting> dice_settings_;
-
 };
-
+#endif
