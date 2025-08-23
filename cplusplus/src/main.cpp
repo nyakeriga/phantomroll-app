@@ -1,4 +1,4 @@
-// ...existing code...
+// main.cpp
 #include <iostream>
 #include <csignal>
 #include <cstdlib>
@@ -13,7 +13,6 @@
 #include "core/socket_server.hpp"
 #include "core/logger.hpp"
 #include "nlohmann/json.hpp"
-
 // TDLib wrappers
 namespace utils {
     class ConfigLoader {
@@ -30,22 +29,17 @@ namespace utils {
         std::string path_;
     };
 }
-
 using json = nlohmann::json;
-
 // Global pointers for graceful shutdown
-// changed to non-static so other translation units can reference via `extern`
+// changed to non-static so other translation units can reference via extern
 SocketServer* g_control_server = nullptr;
 MessageHandler* g_handler = nullptr;
-
 // Atomic running flag used across threads and signal handler
 static std::atomic<bool> running{true};
-
 // Minimal, signal-safe handler: flip running flag
 static void signal_handler(int /*signal*/) {
     running = false;
 }
-
 void start_heartbeat() {
     std::thread([] {
         while (running.load()) {
@@ -55,11 +49,9 @@ void start_heartbeat() {
         }
     }).detach();
 }
-
 int main(int argc, char* argv[]) {
     std::cout.sync_with_stdio(true);
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-
     std::cout << "[INFO] PhantomRoll starting...\n";
 
     std::string session_suffix = "default";
@@ -113,6 +105,7 @@ int main(int argc, char* argv[]) {
 
         MessageHandler handler(session, settings);
         g_handler = &handler; // set global pointer
+        handler.run();
 
         auto logger = std::make_shared<Logger>(Logger::Level::INFO);
         SocketServer control_server(8879, logger);
@@ -120,7 +113,7 @@ int main(int argc, char* argv[]) {
 
         // Start TCP socket server for GUI/production
         control_server.start();
-        std::cout << "[INFO] Control server running on port 8879\n";
+        Logger::infoGlobal("Control server will start on port 8879");
 
         // Authentication thread
         std::thread auth_thread([&]() {
@@ -168,7 +161,6 @@ int main(int argc, char* argv[]) {
         std::cout << "[INFO] Authenticated successfully.\n";
 
         // Start handler loop in separate thread
-        std::thread handler_thread([&handler]() { handler.run(); });
 
         start_heartbeat();
 
@@ -183,8 +175,6 @@ int main(int argc, char* argv[]) {
         if (g_handler) g_handler->stop();
         session.close();
 
-        if (handler_thread.joinable()) handler_thread.join();
-
     } catch (const std::exception& e) {
         std::cerr << "[FATAL] " << e.what() << "\n";
         return EXIT_FAILURE;
@@ -193,4 +183,3 @@ int main(int argc, char* argv[]) {
     std::cout << "[INFO] PhantomRoll stopped.\n";
     return 0;
 } // main
-// End of main.cpp  -------
