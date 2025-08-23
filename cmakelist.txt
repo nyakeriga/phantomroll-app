@@ -1,1 +1,132 @@
+cmake_minimum_required(VERSION 3.16)
+project(PhantomRoll VERSION 1.0 LANGUAGES CXX)
+
+# -----------------------------
+# C++ standard
+# -----------------------------
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# -----------------------------
+# Source files
+# -----------------------------
+set(SRC_DIR "${CMAKE_SOURCE_DIR}/src")
+file(GLOB_RECURSE SOURCES "${SRC_DIR}/*.cpp")
+
+if(NOT SOURCES)
+    message(FATAL_ERROR "No source files found in ${SRC_DIR}")
+endif()
+
+# -----------------------------
+# Check config.json exists
+# -----------------------------
+set(CONFIG_FILE "${CMAKE_SOURCE_DIR}/../resources/config.json")
+if(NOT EXISTS ${CONFIG_FILE})
+    message(FATAL_ERROR "Missing required file: ${CONFIG_FILE}")
+endif()
+
+# -----------------------------
+# Executable
+# -----------------------------
+add_executable(phantomroll_exec ${SOURCES})
+
+# -----------------------------
+# Include directories
+# -----------------------------
+target_include_directories(phantomroll_exec PRIVATE
+    "${CMAKE_SOURCE_DIR}/include"
+)
+
+# -----------------------------
+# Dependencies
+# -----------------------------
+find_package(OpenSSL REQUIRED)
+find_library(PTHREAD_LIB pthread)
+find_library(ZLIB_LIB z)
+
+if(WIN32)
+    # Windows TDLib paths
+    set(TDLIB_INCLUDE "C:/tdlib/include")
+    set(TDLIB_PATH "C:/tdlib/build/Release")
+else()
+    # Linux/WSL TDLib paths
+    set(TDLIB_INCLUDE "/mnt/c/Users/Administrator/Desktop/tdlib/include")
+    set(TDLIB_PATH "/mnt/c/Users/Administrator/Desktop/tdlib/build")
+endif()
+
+target_include_directories(phantomroll_exec PRIVATE ${TDLIB_INCLUDE})
+link_directories(${TDLIB_PATH})
+
+# -----------------------------
+# Link TDLib libraries (correct static order)
+# -----------------------------
+if(NOT WIN32)
+    target_link_libraries(phantomroll_exec PRIVATE
+        # TDLib core
+        ${TDLIB_PATH}/libtdjson_static.a
+        ${TDLIB_PATH}/libtdclient.a
+        ${TDLIB_PATH}/libtdcore.a
+        ${TDLIB_PATH}/libtdapi.a
+        ${TDLIB_PATH}/libtdmtproto.a
+        ${TDLIB_PATH}/libtdjson_private.a
+  # TDLib sub-libraries
+        ${TDLIB_PATH}/tdutils/libtdutils.a
+        ${TDLIB_PATH}/tdactor/libtdactor.a
+        ${TDLIB_PATH}/tdnet/libtdnet.a
+        ${TDLIB_PATH}/tdtl/libtdtl.a
+        ${TDLIB_PATH}/tddb/libtddb.a
+        ${TDLIB_PATH}/tde2e/libtde2e.a
+        ${TDLIB_PATH}/sqlite/libtdsqlite.a
+
+        # Add missing object files for static build
+        ${TDLIB_PATH}/tdutils/CMakeFiles/tdutils.dir/td/utils/find_boundary.cpp.o
+        ${TDLIB_PATH}/tdutils/CMakeFiles/tdutils.dir/td/utils/Ed25519.cpp.o
+
+        # System libs
+        ${PTHREAD_LIB}
+        ${ZLIB_LIB}
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        dl
+        readline
+    )
+else()
+    target_link_libraries(phantomroll_exec PRIVATE
+        ${TDLIB_PATH}/td.lib
+        OpenSSL::SSL
+        OpenSSL::Crypto
+    )
+endif()
+
+# -----------------------------
+# Compiler warnings
+# -----------------------------
+if(NOT MSVC)
+    target_compile_options(phantomroll_exec PRIVATE -Wall -Wextra -Wpedantic -pthread)
+else()
+    target_compile_options(phantomroll_exec PRIVATE /W4 /permissive-)
+endif()
+
+# -----------------------------
+# Output directory
+# -----------------------------
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin")
+
+# -----------------------------
+# Auto-copy config.json into build resources
+# -----------------------------
+add_custom_command(TARGET phantomroll_exec POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        $<TARGET_FILE_DIR:phantomroll_exec>/resources/config
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CONFIG_FILE}
+        $<TARGET_FILE_DIR:phantomroll_exec>/resources/config/config.json
+    COMMENT "Copying config.json to build/resources/config"
+)
+
+target_include_directories(phantomroll_exec PRIVATE
+    ${CMAKE_SOURCE_DIR}/cplusplus/include
+)
+
+
 
