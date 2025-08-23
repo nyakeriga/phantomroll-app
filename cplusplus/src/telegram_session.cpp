@@ -1,7 +1,12 @@
+// telegram_session.cpp
+// ----------------------------------------------------------------------------
+// PhantomRoll – Telegram Session implementation
+// ----------------------------------------------------------------------------
+
 #include "core/telegram_session.hpp"
+#include "core/message_handler.hpp"
 #include <td/telegram/td_api.h>
 #include <td/telegram/td_json_client.h>
-
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -29,142 +34,145 @@
 #include <stdexcept>
 #include <cstdio>
 #include <atomic>
+#include <map>
+#include <regex> // IMPROVEMENT: Added for regex functionality
 
 #include "core/logger.hpp"
-
 using json = nlohmann::json;
+
 using namespace std::literals::chrono_literals;
 
 // alias for monotonic time
 using Clock = std::chrono::steady_clock;
 
+#ifdef __unix__
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#endif
+
+// forward-declare MessageHandler so extern can compile without including header
+class MessageHandler;
+extern MessageHandler* g_handler;
+
+// static control-server globals (keeps header changes optional)
+static std::atomic<bool> s_control_server_running{false};
+static std::thread s_control_thread;
+static int s_control_server_fd = -1;
+
 // ----------------- internal helpers & anonymous namespace -----------------
 namespace {
 
-std::string now_ts() {
-    using namespace std::chrono;
-    auto n = system_clock::now();
-    auto t = system_clock::to_time_t(n);
-    std::tm tm{};
-#ifdef _WIN32
-    localtime_s(&tm, &t);
-#else
-    localtime_r(&t, &tm);
-#endif
-    auto ms = duration_cast<milliseconds>(n.time_since_epoch()) % 1000;
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S")
-        << "." << std::setw(3) << std::setfill('0') << ms.count();
-    return oss.str();
-}
+    std::string now_ts() {
+        using namespace std::chrono;
+        auto n = system_clock::now();
+        auto t = system_clock::to_time_t(n);
+        std::tm tm{};
+    #ifdef _WIN32
+        localtime_s(&tm, &t);
+    #else
+        localtime_r(&t, &tm);
+    #endif
+        auto ms = duration_cast<milliseconds>(n.time_since_epoch()) % 1000;
+        std::ostringstream oss;
+        oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S")
+            << "." << std::setw(3) << std::setfill('0') << ms.count();
+        return oss.str();
+    }
 
-void sleep_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+    void sleep_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 
-std::string rand_token() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    std::uniform_int_distribution<uint64_t> d;
-    std::ostringstream o; o << std::hex << d(rng);
-    return o.str();
-}
+    std::string rand_token() {
+        static thread_local std::mt19937_64 rng{std::random_device{}()};
+        std::uniform_int_distribution<uint64_t> d;
+        std::ostringstream o; o << std::hex << d(rng);
+        return o.str();
+    }
 
-inline int roll_die(std::mt19937_64& rng) {
-    static thread_local std::uniform_int_distribution<int> d(1,6);
-    return d(rng);
-}
+    std::size_t hash_allowed(const std::set<int>& S) {
+        std::size_t h = 1469598103934665603ull;
+        for (int x : S) { h ^= static_cast<std::size_t>(x); h *= 1099511628211ull; }
+        return h;
+    }
 
-inline double variance3(int a, int b, int c) {
-    double m = (a + b + c) / 3.0;
-    double v1 = a - m, v2 = b - m, v3 = c - m;
-    return (v1*v1 + v2*v2 + v3*v3) / 3.0;
-}
+    inline int roll_die(std::mt19937_64& rng) {
+        static thread_local std::uniform_int_distribution<int> d(1,6);
+        return d(rng);
+    }
 
-struct BestTriple { int i=-1,j=-1,k=-1; int sum=-1; double var=0.0; bool found=false; };
+    inline double variance3(int a, int b, int c) {
+        double m = (a + b + c) / 3.0;
+        double v1 = a - m, v2 = b - m, v3 = c - m;
+        return (v1*v1 + v2*v2 + v3*v3) / 3.0;
+    }
 
-BestTriple best_triple_from_vector(const std::vector<int>& V, const std::set<int>& allowed) {
-    BestTriple bt;
-    if (V.size() < 3) return bt;
-    const bool unconstrained = allowed.empty();
-    int n = (int)V.size();
-    for (int i=0;i<n;++i) for (int j=i+1;j<n;++j) for (int k=j+1;k<n;++k) {
-        int s = V[i] + V[j] + V[k];
-        if (!unconstrained && !allowed.count(s)) continue;
-        double v = variance3(V[i], V[j], V[k]);
-        if (!bt.found ||
-            (s > bt.sum) ||
-            (s == bt.sum && v < bt.var) ||
-            (s == bt.sum && std::abs(v - bt.var) < 1e-12 && std::tie(i,j,k) < std::tie(bt.i, bt.j, bt.k))) {
-            bt = {i,j,k,s,v,true};
+    struct BestTriple { int i=-1,j=-1,k=-1; int sum=-1; double var=0.0; bool found=false; };
+
+    BestTriple best_triple_from_vector(const std::vector<int>& V, const std::set<int>& allowed) {
+        BestTriple bt;
+        if (V.size() < 3) return bt;
+        const bool unconstrained = allowed.empty();
+        int n = (int)V.size();
+        for (int i=0;i<n;++i) for (int j=i+1;j<n;++j) for (int k=j+1;k<n;++k) {
+            int s = V[i] + V[j] + V[k];
+            if (!unconstrained && !allowed.count(s)) continue;
+            double v = variance3(V[i], V[j], V[k]);
+            if (!bt.found ||
+                (s > bt.sum) ||
+                (s == bt.sum && v < bt.var) ||
+                (s == bt.sum && std::abs(v - bt.var) < 1e-12 && std::tie(i,j,k) < std::tie(bt.i, bt.j, bt.k))) {
+                bt = {i,j,k,s,v,true};
+            }
         }
+        return bt;
     }
-    return bt;
+
+    int simulate_best_sum_once(int N, const std::set<int>& allowed, std::mt19937_64& rng) {
+        std::vector<int> V; V.reserve(N);
+        for (int t=0;t<N;++t) V.push_back(roll_die(rng));
+        auto bt = best_triple_from_vector(V, allowed);
+        return bt.found ? bt.sum : -1;
+    }
+
+    bool json_has_extra(const json& j, const std::string& extra) {
+        return j.contains("@extra") && j["@extra"].is_string() && j["@extra"].get<std::string>() == extra;
+    }
 }
-
-bool json_has_extra(const json& j, const std::string& extra) {
-    return j.contains("@extra") && j["@extra"].is_string() && j["@extra"].get<std::string>() == extra;
-}
-
-// file-local guard to protect send_best3_dice_to_public from re-entry without modifying header
-static std::atomic<bool> sending_dice_flag{false};
-struct LocalSendingGuard {
-    std::atomic<bool>& flag;
-    bool owned;
-    LocalSendingGuard(std::atomic<bool>& f) : flag(f), owned(false) {
-        bool expected = false;
-        owned = flag.compare_exchange_strong(expected, true);
-    }
-    ~LocalSendingGuard() {
-        if (owned) flag.store(false);
-    }
-    bool ok() const { return owned; }
-};
-
-} // namespace
 
 // ----------------- dice result tracking globals -----------------
-struct DiceKey {
-    int64_t chat_id;
-    int64_t msg_id;
-    bool operator==(DiceKey const& o) const { return chat_id==o.chat_id && msg_id==o.msg_id; }
-};
-struct DiceKeyHash {
-    std::size_t operator()(DiceKey const& k) const noexcept {
-        return std::hash<int64_t>()(k.chat_id ^ (k.msg_id<<1));
-    }
-};
+struct DiceKey { int64_t chat_id; int64_t msg_id; bool operator==(DiceKey const& o) const { return chat_id==o.chat_id && msg_id==o.msg_id; } };
+struct DiceKeyHash { std::size_t operator()(DiceKey const& k) const noexcept { return std::hash<int64_t>()(k.chat_id ^ (k.msg_id<<1)); } };
 static std::unordered_map<DiceKey,int,DiceKeyHash> g_dice_values;
 static std::mutex g_dice_mtx;
 static std::condition_variable g_dice_cv;
 
-// ----------------- @extra response mailbox -----------------
-static std::mutex g_extra_mtx;
-static std::condition_variable g_extra_cv;
-static std::unordered_map<std::string, json> g_extra_responses;
-
 // ----------------- helpers that call TelegramSession methods -----------------
-static nlohmann::json request_with_extra_blocking(TelegramSession* self,
-                                                  nlohmann::json req,
-                                                  const std::string& extra,
-                                                  double total_timeout_sec) {
-    // attach extra and send
+static nlohmann::json request_with_extra_blocking(TelegramSession* self, nlohmann::json req, const std::string& extra, double total_timeout_sec) {
+    using Clock = std::chrono::steady_clock;
+
     req["@extra"] = extra;
     self->send(req.dump());
 
-    // wait (listener will deliver the response into g_extra_responses)
     auto deadline = Clock::now() + std::chrono::milliseconds(static_cast<int>(total_timeout_sec * 1000.0));
-    std::unique_lock<std::mutex> lk(g_extra_mtx);
     while (Clock::now() < deadline) {
-        auto it = g_extra_responses.find(extra);
-        if (it != g_extra_responses.end()) {
-            json out = std::move(it->second);
-            g_extra_responses.erase(it);
-            return out;
+        std::string resp = self->receive(0.5);
+        if (resp.empty()) continue;
+        try {
+            nlohmann::json jr = nlohmann::json::parse(resp);
+            if (json_has_extra(jr, extra)) return jr;
+            self->on_update(jr);
+        } catch (const std::exception& e) {
+            Logger::errorGlobal("request_with_extra_blocking: JSON parse error: " + std::string(e.what()));
         }
-        g_extra_cv.wait_until(lk, deadline);
     }
-    return json(); // timeout
+    return nlohmann::json();
 }
 
 // ----------------- TelegramSession implementation -----------------
+
 TelegramSession::TelegramSession()
 : client_(nullptr)
 , logger_(std::make_unique<Logger>(Logger::Level::INFO))
@@ -180,21 +188,15 @@ TelegramSession::TelegramSession()
 }
 
 TelegramSession::~TelegramSession() {
-    // First, stop the update listener safely
     stop_update_listener();
-
-    // Lock before accessing the client
-    {
-        std::lock_guard<std::mutex> lk(client_mutex_);
-        if (client_) {
-            // Destroy TDLib client safely
-            td_json_client_destroy(client_);
-            client_ = nullptr;
-        }
+    stop_control_server();
+    std::lock_guard<std::mutex> lk(client_mutex_);
+    if (client_) {
+        try { td_json_client_destroy(client_); } catch(...) {}
+        client_ = nullptr;
     }
 }
 
-// ...existing includes and using statements...
 void TelegramSession::initialize(const nlohmann::json& config_override) {
     if (!config_override.is_null() && !config_override.empty()) {
         config_ = config_override;
@@ -208,8 +210,30 @@ void TelegramSession::initialize(const nlohmann::json& config_override) {
         std::cout << "[DEBUG] Loaded fallback config from: " << fallback_path << std::endl;
     }
 
-    if (!config_.contains("api_id") || !config_.contains("api_hash")) {
-        throw std::runtime_error(" Missing required api_id or api_hash in config.");
+    // Validate config
+    if (!config_.contains("api_id") || !config_["api_id"].is_number_integer()) {
+        throw std::runtime_error("Missing or invalid 'api_id' in config.");
+    }
+    if (!config_.contains("api_hash") || !config_["api_hash"].is_string()) {
+        throw std::runtime_error("Missing or invalid 'api_hash' in config.");
+    }
+    if (config_.contains("groups") && !config_["groups"].is_array()) {
+        throw std::runtime_error("Invalid 'groups' field in config; must be an array.");
+    }
+    if (config_.contains("dice_settings") && !config_["dice_settings"].is_object()) {
+        throw std::runtime_error("Invalid 'dice_settings' field in config; must be an object.");
+    }
+
+    private_dice_group_id_ = config_.value("private_dice_group_id", private_dice_group_id_);
+    if (config_.contains("groups") && config_["groups"].is_array()) {
+        public_groups_.clear();
+        for (const auto &g : config_["groups"]) {
+            GroupInfo gi;
+            gi.id = g.value("id", 0LL);
+            gi.name = g.value("name", std::string());
+            gi.interval_ms = g.value("interval_ms", 1000);
+            if (gi.id != 0 || !gi.name.empty()) public_groups_.push_back(gi);
+        }
     }
 
     client_ = td_json_client_create();
@@ -238,7 +262,6 @@ void TelegramSession::initialize(const nlohmann::json& config_override) {
               << ", api_hash = " << config_["api_hash"] << std::endl;
 }
 
-// --- Implementation for the linker ---
 void TelegramSession::sendTdlibParameters() {
     if (!client_) {
         client_ = td_json_client_create();
@@ -270,7 +293,6 @@ void TelegramSession::sendTdlibParameters() {
         else std::cerr << "sendTdlibParameters(): exception: " << ex.what() << std::endl;
     }
 
-    // Optional: set TDLib log verbosity if configured
     int loglvl = config_.value("tdlib_log_level", 1);
     nlohmann::json log_msg = {
         {"@type", "setLogVerbosityLevel"},
@@ -285,111 +307,46 @@ void TelegramSession::sendTdlibParameters() {
 }
 
 bool TelegramSession::authenticate() {
-    bool use_external_auth = safe_get(config_, "external_auth", false);
+    bool use_external_auth = false;
+
+    if (config_.contains("external_auth") && config_["external_auth"].is_boolean()) {
+        use_external_auth = config_["external_auth"].get<bool>();
+    }
+
     if (use_external_auth) {
         logger_->info("authenticate(): expecting external TDLib auth flow");
-        start_update_listener(); // still listen so external flow can work
         return true;
     }
 
     logger_->info("authenticate(): starting automated TDLib auth");
 
-    // 1) Ensure the update listener is running
-    start_update_listener();
-
-    // 2) Wait for TDLib to ask for parameters
-    {
-        std::unique_lock<std::mutex> lk(auth_mutex_);
-        bool ok = auth_cv_.wait_for(lk, std::chrono::seconds(8), [this]() {
-            return current_auth_stage_ == AuthStage::WaitPhoneNumber
-                || current_auth_stage_ == AuthStage::WaitCode
-                || current_auth_stage_ == AuthStage::WaitPassword
-                || current_auth_stage_ == AuthStage::Ready
-                || current_auth_stage_ == AuthStage::Closed
-                || current_auth_stage_ == AuthStage::None;
-        });
-        if (!ok) {
-            logger_->warn("authenticate(): no auth state observed within 8s; proceeding to send parameters anyway");
-        }
-    }
-
-    // 3) Send TDLib parameters
     sendTdlibParameters();
 
-    // 4) React to TDLib auth stages
-    for (;;) {
-        AuthStage stage;
-        {
-            std::unique_lock<std::mutex> lk(auth_mutex_);
-            if (!auth_cv_.wait_for(lk, std::chrono::seconds(60), [this](){ return current_auth_stage_ != AuthStage::None; })) {
-                logger_->warn("authenticate(): timeout waiting for auth update (60s)");
-            }
-            stage = current_auth_stage_;
-        }
+    std::string phone = config_.value("phone_number", "");
+    std::string code = config_.value("login_code", "");
 
-        if (stage == AuthStage::WaitPhoneNumber) {
-            std::string phone = safe_get(config_, "phone_number", std::string{});
-            if (phone.empty()) {
-                std::cout << "Enter your phone number (e.g., +13522070047): ";
-                std::getline(std::cin, phone);
-                phone = trim(phone);
-            }
-            if (phone.empty()) phone = phone_number_;
-            if (phone.empty()) {
-                logger_->error("authenticate(): phone number empty, aborting");
-                return false;
-            }
-            submit_phone_async(phone);
-            continue;
-        }
+    if (phone.empty()) {
+        std::cout << "Enter your phone number (e.g., +13522070047): ";
+        std::getline(std::cin, phone);
+    }
+    if (phone.empty()) phone = phone_number_;
+    submit_phone_async(phone);
 
-        if (stage == AuthStage::WaitCode) {
-            std::string code = safe_get(config_, "login_code", std::string{});
-            if (code.empty()) {
-                std::cout << "Enter login code / 2FA (or 'exit'): ";
-                std::getline(std::cin, code);
-                code = trim(code);
-                if (code == "exit") {
-                    logger_->info("Authentication cancelled by user");
-                    return false;
-                }
-            }
-            submit_code_async(code);
-            continue;
-        }
-
-        if (stage == AuthStage::WaitPassword) {
-            std::string pwd;
-            std::cout << "Enter 2FA password (or 'exit'): ";
-            std::getline(std::cin, pwd);
-            pwd = trim(pwd);
-            if (pwd == "exit" || pwd.empty()) {
-                logger_->info("Authentication cancelled by user (password)");
-                return false;
-            }
-            submit_2fa_async(pwd);
-            continue;
-        }
-
-        if (stage == AuthStage::Ready) {
-            authorized_ = true;
-            logger_->info("Authentication completed successfully (authorizationStateReady)");
-            return true;
-        }
-
-        if (stage == AuthStage::Closed) {
-            logger_->error("TDLib authorization closed unexpectedly");
+    if (code.empty()) {
+        std::cout << "Enter login code / 2FA (or 'exit'): ";
+        std::getline(std::cin, code);
+        if (code == "exit") {
+            logger_->info("Authentication cancelled");
             return false;
         }
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
+    submit_code_async(code);
 
-    return false; // not reached
+    return true;
 }
 
-void TelegramSession::forceLogin() {
-    logger_->info("forceLogin() called");
+void TelegramSession::forceLogin() { 
+    logger_->info("forceLogin() called"); 
 }
 
 void TelegramSession::submit_phone_async(const std::string& phone) {
@@ -404,63 +361,33 @@ void TelegramSession::submit_phone_async(const std::string& phone) {
 }
 
 void TelegramSession::submit_code_async(const std::string& code) {
-    // Trim and validate the code
     std::string clean_code = trim(code);
     if (clean_code.empty()) {
-        if (logger_) logger_->error("submit_code_async: Code is empty after trimming");
-        else std::cerr << "[ERROR] submit_code_async: Code is empty after trimming" << std::endl;
+        logger_->error("submit_code_async: code is empty after trimming");
         return;
     }
-
-    // Build the request
-    json req = {
-        {"@type", "checkAuthenticationCode"},
-        {"code", clean_code}
-    };
-
-    try {
-        // Send the request to TDLib and use mailbox wait
-        request_with_extra_blocking(this, req, "auth_code:" + rand_token(), 10.0);
-        if (logger_) logger_->info("submit_code_async: Submitted login code asynchronously: " + clean_code);
-        std::cout << "[AUTH] Submitted login code asynchronously: " << clean_code << std::endl;
-    } catch (const std::exception& ex) {
-        if (logger_) logger_->error(std::string("submit_code_async: Exception occurred: ") + ex.what());
-        else std::cerr << "[ERROR] submit_code_async: Exception occurred: " << ex.what() << std::endl;
-    }
+    json req = { {"@type","checkAuthenticationCode"}, {"code", clean_code} };
+    request_with_extra_blocking(this, req, "auth_code:" + rand_token(), 10.0);
 }
 
 void TelegramSession::submit_2fa_async(const std::string& password) {
     std::string clean_pwd = trim(password);
     if (clean_pwd.empty()) {
-        if (logger_) logger_->error("submit_2fa_async: Password is empty after trimming");
-        else std::cerr << "[ERROR] submit_2fa_async: Password is empty after trimming" << std::endl;
+        logger_->error("submit_2fa_async: password is empty after trimming");
         return;
     }
-
-    json req = {
-        {"@type", "checkAuthenticationPassword"},
-        {"password", clean_pwd}
-    };
-
-    try {
-        request_with_extra_blocking(this, req, "auth_pwd:" + rand_token(), 10.0);
-        if (logger_) logger_->info("submit_2fa_async: Submitted 2FA password asynchronously");
-        std::cout << "[AUTH] Submitted 2FA password asynchronously: " << clean_pwd << std::endl;
-    } catch (const std::exception& ex) {
-        if (logger_) logger_->error(std::string("submit_2fa_async: Exception occurred: ") + ex.what());
-        else std::cerr << "[ERROR] submit_2fa_async: Exception occurred: " << ex.what() << std::endl;
-    }
+    json req = { {"@type","checkAuthenticationPassword"}, {"password", clean_pwd} };
+    request_with_extra_blocking(this, req, "auth_pwd:" + rand_token(), 10.0);
 }
 
-// (these stray declarations were likely accidental in your file; keeping them no-op to preserve build)
-void submit_2fa_async(const std::string& password);
-void submit_code(const std::string& code);
-void submit2FA(const std::string& password);
-void add_phone_number(const std::string& phone);
+void TelegramSession::submit_code(const std::string& code) { submit_code_async(code); }
+void TelegramSession::submit2FA(const std::string& password) { submit_2fa_async(password); }
+void TelegramSession::add_phone_number(const std::string& phone) { submit_phone_async(phone); }
 
 void TelegramSession::set_auth_callback(std::function<void(AuthStage)> cb) {
     auth_callback_ = std::move(cb);
 }
+
 TelegramSession::AuthStage TelegramSession::get_auth_stage() const {
     return current_auth_stage_;
 }
@@ -471,12 +398,15 @@ void TelegramSession::set_allowed_sums(const std::set<int>& allowed) {
 const std::set<int>& TelegramSession::get_allowed_sums() const {
     return allowed_sums_;
 }
+
 void TelegramSession::set_dice_emoji(const std::string& emoji) {
     dice_emoji_ = emoji;
 }
+
 void TelegramSession::set_group_target(const std::string& group_name_or_id) {
     target_group_ = group_name_or_id;
 }
+
 void TelegramSession::add_group_name(const std::string& group) {
     GroupInfo gi; gi.name = group; gi.id = 0; gi.interval_ms = 1000;
     public_groups_.push_back(gi);
@@ -485,41 +415,42 @@ void TelegramSession::add_group_name(const std::string& group) {
 void TelegramSession::send(const std::string& payload) {
     std::lock_guard<std::mutex> lk(client_mutex_);
     if (!client_) {
-        Logger::log("send(): TDLib client not initialized", Logger::ERROR);
+        Logger::errorGlobal("send(): TDLib client not initialized");
         return;
     }
 
-    // Normalize dice emoji only if missing/empty → default to 🎲
-    std::string out_payload = payload;
     try {
-        json jp = json::parse(payload);
+        auto jp = json::parse(payload);
         if (jp.is_object() && jp.contains("@type") && jp["@type"].is_string() && jp["@type"] == "sendMessage") {
             if (jp.contains("input_message_content") && jp["input_message_content"].is_object()) {
-                auto &imc = jp["input_message_content"];
+                const auto &imc = jp["input_message_content"];
                 if (imc.contains("@type") && imc["@type"].is_string() && imc["@type"] == "inputMessageDice") {
-                    if (!imc.contains("emoji") || !imc["emoji"].is_string() || imc["emoji"].get<std::string>().empty()) {
-                        imc["emoji"] = u8"🎲";
+                    bool enabled = config_.value("enable_auto_publish", false);
+                    if (!enabled) {
+                        std::string reason = "Blocked inputMessageDice send (enable_auto_publish=false)";
+                        if (logger_) logger_->warn(reason);
+                        append_audit(reason + " payload=" + jp.dump());
+                        return;
                     }
                 }
             }
         }
-        out_payload = jp.dump();
-    } catch (...) {
-        // fallback: use original payload
+    } catch (const std::exception& e) {
+        Logger::errorGlobal("send(): JSON parse error: " + std::string(e.what()));
     }
 
     try {
-        td_json_client_send(client_, out_payload.c_str());
-        Logger::log("TDLib send: " + (out_payload.size() > 200 ? out_payload.substr(0,200) + "..." : out_payload), Logger::INFO);
+        td_json_client_send(client_, payload.c_str());
+        if (logger_) logger_->info("TDLib send: " + (payload.size() > 200 ? payload.substr(0,200) + "..." : payload));
     } catch (const std::exception& e) {
-        Logger::log(std::string("send exception: ") + e.what(), Logger::ERROR);
+        if (logger_) logger_->error(std::string("send exception: ") + e.what());
     }
 }
 
 std::string TelegramSession::receive(double timeout_seconds) {
     std::lock_guard<std::mutex> lk(client_mutex_);
     if (!client_) {
-        Logger::log("receive(): TDLib client not initialized", Logger::ERROR);
+        Logger::errorGlobal("receive(): TDLib client not initialized");
         return {};
     }
     const char* resp = td_json_client_receive(client_, timeout_seconds);
@@ -572,8 +503,6 @@ void TelegramSession::handle_update(const json& update) {
         }
         return;
     }
-
-    (void) t;
 }
 
 void TelegramSession::handle_auth_update(const json& st) {
@@ -613,25 +542,12 @@ void TelegramSession::start_update_listener() {
                 if (s.empty()) continue;
                 try {
                     json j = json::parse(s);
-
-                    // Deliver function results carrying @extra to the mailbox.
-                    if (j.contains("@extra") && j["@extra"].is_string()) {
-                        std::string extra = j["@extra"].get<std::string>();
-                        {
-                            std::lock_guard<std::mutex> lk(g_extra_mtx);
-                            g_extra_responses[extra] = j;
-                        }
-                        g_extra_cv.notify_all();
-                        continue; // don't pass to handle_update
-                    }
-
-                    // Only pass TDLib updates to update handler
                     handle_update(j);
-                } catch(...) {
-                    // swallow parse/dispatch errors
+                } catch (const std::exception& e) {
+                    logger_->error("update listener: JSON parse error: " + std::string(e.what()));
                 }
-            } catch(...) {
-                // swallow receive errors
+            } catch (const std::exception& e) {
+                logger_->error("update listener: exception: " + std::string(e.what()));
             }
         }
         logger_->info("update listener stopped");
@@ -640,86 +556,38 @@ void TelegramSession::start_update_listener() {
 
 void TelegramSession::stop_update_listener() {
     if (!listening_) return;
-    stop_update_listener_flag_ = true; // signal the listener to stop
-
-    if (update_listener_thread_.joinable()) {
-        update_listener_thread_.join();
-    }
-
-    {
-        std::lock_guard<std::mutex> lk(client_mutex_);
-        // Optional: ensure client isn't used after stopping
-    }
-
+    stop_update_listener_flag_ = true;
+    if (update_listener_thread_.joinable()) update_listener_thread_.join();
     listening_ = false;
 }
 
 int TelegramSession::sendDice(int64_t chat_id, int /*dice_value*/) {
-    std::lock_guard<std::mutex> lk(client_mutex_);
-    if (!client_) {
-        logger_->error("sendDice(): TDLib client not initialized");
-        append_audit("sendDice failed: client not initialized");
-        return 0;
-    }
-
-    // Build request
     json req = {
-        {"@type", "sendMessage"},
+        {"@type","sendMessage"},
         {"chat_id", chat_id},
-        {"input_message_content", {
-            {"@type", "inputMessageDice"},
-            {"emoji", dice_emoji_}
-        }}
+        {"input_message_content", { {"@type","inputMessageDice"}, {"emoji", dice_emoji_} }}
     };
-
-    try {
-        std::string extra = "senddice:" + std::to_string(chat_id) + ":" + rand_token();
-        json resp = request_with_extra_blocking(this, req, extra, 10.0);
-
-        if (!resp.is_object()) {
-            logger_->error("sendDice: timeout");
-            append_audit("sendDice timeout chat=" + std::to_string(chat_id));
-            return 0;
-        }
-
-        if (resp.contains("@type") && resp["@type"] == "error") {
-            logger_->error("sendDice error: " + resp.dump());
-            append_audit("sendDice error: " + resp.dump());
-            return 0;
-        }
-
-        if (resp.contains("@type") && resp["@type"] == "message" && resp.contains("id")) {
-            int64_t mid = resp["id"].get<int64_t>();
-            append_audit("Sent dice chat=" + std::to_string(chat_id) + " msg=" + std::to_string(mid));
-            return static_cast<int>(mid);
-        }
-
-        logger_->warn("sendDice: unknown response: " + resp.dump());
-        append_audit("sendDice unknown response chat=" + std::to_string(chat_id));
-        return 0;
-
-    } catch (const std::exception& e) {
-        logger_->error(std::string("sendDice exception: ") + e.what());
-        append_audit(std::string("sendDice exception: ") + e.what());
-        return 0;
+    std::string extra = "senddice:" + std::to_string(chat_id) + ":" + rand_token();
+    json resp = request_with_extra_blocking(this, req, extra, 10.0);
+    if (!resp.is_object()) { logger_->error("sendDice: timeout"); append_audit("sendDice timeout chat=" + std::to_string(chat_id)); return 0; }
+    if (resp.contains("@type") && resp["@type"] == "error") { logger_->error("sendDice error: " + resp.dump()); append_audit("sendDice error: " + resp.dump()); return 0; }
+    if (resp.contains("@type") && resp["@type"] == "message" && resp.contains("id")) {
+        int64_t mid = resp["id"].get<int64_t>();
+        append_audit("Sent dice chat=" + std::to_string(chat_id) + " msg=" + std::to_string(mid));
+        return static_cast<int>(mid);
     }
+    return 0;
 }
 
 int TelegramSession::waitForDiceValue(int64_t chat_id, int msg_id, int timeout_ms) {
     std::unique_lock<std::mutex> lk(g_dice_mtx);
-    DiceKey key{chat_id, static_cast<int64_t>(msg_id)};
-    auto pred = [&]() { return g_dice_values.find(key) != g_dice_values.end(); };
-
-    if (!g_dice_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), pred)) {
-        return -1; // timeout
-    }
-
+    DiceKey key{chat_id, (int64_t)msg_id};
+    auto pred = [&](){ return g_dice_values.find(key) != g_dice_values.end(); };
+    if (!g_dice_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), pred)) return -1;
     return g_dice_values[key];
 }
 
 std::vector<int64_t> TelegramSession::sendDiceBatch(int64_t chat_id, int count, int pacing_ms, const std::string& emoji) {
-    if (logger_) logger_->info("[TRACE] sendDiceBatch called on thread " +
-              std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())));
     std::string saved = dice_emoji_;
     if (!emoji.empty()) dice_emoji_ = emoji;
     std::vector<int64_t> ids; ids.reserve(count);
@@ -746,23 +614,25 @@ std::optional<std::tuple<int,int,int>> TelegramSession::pick_best_triple(const s
     return std::make_tuple(bt.i, bt.j, bt.k);
 }
 
-// Implementation for the vector overload declared in the header
-std::vector<int> TelegramSession::pick_best_triple(const std::vector<int>& V) const {
+std::vector<int> TelegramSession::pick_best_triple(const std::vector<int>& dice_values) const {
     const auto& allowed = valid_sums_.empty() ? allowed_sums_ : valid_sums_;
-    BestTriple bt = best_triple_from_vector(V, allowed);
-    if (!bt.found) return {};
+    BestTriple bt = best_triple_from_vector(dice_values, allowed);
+    if (!bt.found) {
+        return {};
+    }
     return {bt.i, bt.j, bt.k};
 }
 
-void TelegramSession::on_update(const json& update) {
+void TelegramSession::on_update(const nlohmann::json& update) {
     try {
         if (!update.contains("@type")) return;
+
         const std::string& type = update["@type"].get<std::string>();
 
         if (type == "updateNewMessage") {
             const auto& msg = update.value("message", json{});
-            std::cout << "[UPDATE] New message from chat "
-                      << msg.value("chat_id", 0)
+            std::cout << "[UPDATE] New message from chat " 
+                      << msg.value("chat_id", 0) 
                       << ": " << msg.dump() << std::endl;
 
             {
@@ -793,102 +663,93 @@ void TelegramSession::on_update(const json& update) {
 
     } catch (const std::exception& e) {
         std::cerr << "[ERROR] Exception in on_update: " << e.what() << std::endl;
+        logger_->error("on_update: exception: " + std::string(e.what()));
     } catch (...) {
         std::cerr << "[ERROR] Unknown exception in on_update" << std::endl;
+        logger_->error("on_update: unknown exception");
     }
 }
 
-// --- MODIFIED LOGIC: send dice directly to public group, not as copy/forward ---
 void TelegramSession::send_best3_dice_to_public() {
-    LocalSendingGuard guard(sending_dice_flag);
-    if (!guard.ok()) {
-        if (logger_) logger_->warn("send_best3_dice_to_public: already running, skipping duplicate");
+    if (!config_.value("enable_auto_publish", false)) {
+        logger_->info("send_best3_dice_to_public: auto publish disabled by config");
+        append_audit("Auto-publish disabled; skipping send_best3_dice_to_public");
         return;
     }
-    if (logger_) logger_->info("[TRACE] send_best3_dice_to_public entered");
 
-    try {
-        if (is_paused_) { logger_->warn("send_best3_dice_to_public: paused"); return; }
-        if (!authorized_) { logger_->warn("send_best3_dice_to_public: not authorized"); return; }
-        if (private_dice_group_id_ == 0) { logger_->error("private group not configured"); return; }
-        if (public_groups_.empty()) { logger_->error("no public groups configured"); return; }
+    if (is_paused_) { logger_->warn("send_best3_dice_to_public: paused"); return; }
+    if (!authorized_) { logger_->warn("send_best3_dice_to_public: not authorized"); return; }
+    if (private_dice_group_id_ == 0) { logger_->error("private group not configured"); return; }
+    if (public_groups_.empty()) { logger_->error("no public groups configured"); return; }
 
-        const int MAX_ATTEMPTS = config_.value("max_attempts", 3);
-        const int TOTAL = config_.value("dice_count", 10);
-        const int PER_DICE_TIMEOUT_MS = config_.value("dice_result_timeout_ms", 2000);
-        const int SEND_PACING_MS = std::max(1, dice_settings_[dice_emoji_].interval_ms);
-        bool auto_delete = config_.value("auto_delete_private_rolls", false);
+    const int MAX_ATTEMPTS = config_.value("max_attempts", 3);
+    const int TOTAL = config_.value("dice_count", 10);
+    const int PER_DICE_TIMEOUT_MS = config_.value("dice_result_timeout_ms", 2000);
+    const int SEND_PACING_MS = std::max(1, dice_settings_[dice_emoji_].interval_ms);
+    const auto& allowed = valid_sums_.empty() ? allowed_sums_ : valid_sums_; // Use allowed sums
+    bool auto_delete = config_.value("auto_delete_private_rolls", false);
 
-        for (int attempt=1; attempt<=MAX_ATTEMPTS; ++attempt) {
-            logger_->info("Attempt " + std::to_string(attempt) + " rolling " + std::to_string(TOTAL) + " dice privately");
-            append_audit("Attempt " + std::to_string(attempt) + " rolling private dice");
+    for (int attempt=1; attempt<=MAX_ATTEMPTS; ++attempt) {
+        logger_->info("Attempt " + std::to_string(attempt) + " rolling " + std::to_string(TOTAL) + " dice privately");
+        append_audit("Attempt " + std::to_string(attempt) + " rolling private dice");
 
-            auto msg_ids = sendDiceBatch(private_dice_group_id_, TOTAL, SEND_PACING_MS);
-            append_audit("Sent private dice count=" + std::to_string(msg_ids.size()));
+        auto msg_ids = sendDiceBatch(private_dice_group_id_, TOTAL, SEND_PACING_MS);
+        append_audit("Sent private dice count=" + std::to_string(msg_ids.size()));
 
-            auto vals = waitForDiceResults(private_dice_group_id_, msg_ids, PER_DICE_TIMEOUT_MS);
-            if ((int)vals.size() != TOTAL) { logger_->warn("unexpected results count"); append_audit("unexpected results count"); continue; }
-            bool any_bad=false; for (int v: vals) if (v<1 || v>6) { any_bad=true; break; }
-            if (any_bad) { logger_->warn("some dice invalid"); append_audit("some dice invalid"); continue; }
+        auto vals = waitForDiceResults(private_dice_group_id_, msg_ids, PER_DICE_TIMEOUT_MS);
+        if ((int)vals.size() != TOTAL) { logger_->warn("unexpected results count"); append_audit("unexpected results count"); continue; }
+        bool any_bad=false; for (int v: vals) if (v<1 || v>6) { any_bad=true; break; }
+        if (any_bad) { logger_->warn("some dice invalid"); append_audit("some dice invalid"); continue; }
 
-            std::array<int,10> arr{};
-            for (int i=0;i<TOTAL && i<10;++i) arr[i]=vals[i];
+        std::array<int,10> arr{};
+        for (int i=0;i<TOTAL && i<10;++i) arr[i]=vals[i];
 
-            auto triple = pick_best_triple(arr);
-            if (!triple.has_value()) { logger_->info("no valid triple found"); append_audit("no valid triple"); continue; }
+        auto triple = pick_best_triple(arr); // Uses allowed sums internally
+        if (!triple.has_value()) { logger_->info("no valid triple found"); append_audit("no valid triple"); continue; }
 
-            auto [i,j,k] = triple.value();
-            int v1 = arr[i], v2 = arr[j], v3 = arr[k];
-            int sum = v1 + v2 + v3;
-            append_audit("Picked triple indices (" + std::to_string(i) + "," + std::to_string(j) + "," + std::to_string(k) + ") values (" + std::to_string(v1)+","+std::to_string(v2)+","+std::to_string(v3)+") sum=" + std::to_string(sum));
-            logger_->info("Picked triple sum=" + std::to_string(sum));
+        auto [i,j,k] = triple.value();
+        int v1 = arr[i], v2 = arr[j], v3 = arr[k];
+        int sum = v1 + v2 + v3;
+        if (!allowed.empty() && !allowed.count(sum)) { // Check allowed sums
+            logger_->info("triple sum " + std::to_string(sum) + " not in allowed sums");
+            append_audit("Triple sum " + std::to_string(sum) + " not in allowed sums");
+            continue;
+        }
 
-            // Send new dice messages to each public group, so they look native (not forwarded)
-            for (const auto& g : public_groups_) {
-                if (g.id == 0) continue;
+        append_audit("Picked triple indices (" + std::to_string(i) + "," + std::to_string(j) + "," + std::to_string(k) + ") values (" + std::to_string(v1)+","+std::to_string(v2)+","+std::to_string(v3)+") sum=" + std::to_string(sum));
+        logger_->info("Picked triple sum=" + std::to_string(sum));
 
-                // Send three dice messages
-                for (int n = 0; n < 3; ++n) {
-                    json req = {
-                        {"@type","sendMessage"},
-                        {"chat_id", g.id},
-                        {"input_message_content", { {"@type","inputMessageDice"}, {"emoji", dice_emoji_} }}
-                    };
-                    send(req.dump());
-                    sleep_ms(SEND_PACING_MS);
-                }
+        for (const auto& g : public_groups_) {
+            if (g.id == 0) continue;
 
-                // Send a summary message with the actual best triple values
-                std::ostringstream disc;
-                disc << "Best triple from developer roll: " << v1 << ", " << v2 << ", " << v3 << " (sum = " << sum << ")";
+            for (int n = 0; n < 3; ++n) {
                 json req = {
                     {"@type","sendMessage"},
                     {"chat_id", g.id},
-                    {"input_message_content", {
-                        {"@type","inputMessageText"},
-                        {"text", { {"@type","formattedText"}, {"text", disc.str()} }}
-                    }}
+                    {"input_message_content", { {"@type","inputMessageDice"}, {"emoji", dice_emoji_} }}
                 };
                 send(req.dump());
+                sleep_ms(SEND_PACING_MS);
             }
 
-            if (auto_delete) {
-                bool ok = delete_private_messages(private_dice_group_id_, msg_ids);
-                if (ok) append_audit("Auto-deleted private rolls");
-                else append_audit("Auto-delete failed");
-            }
-
-            logger_->info("Completed send_best3_dice_to_public successfully");
-            return;
+            std::ostringstream disc;
+            disc << "Best triple from developer roll: " << v1 << ", " << v2 << ", " << v3 << " (sum = " << sum << ")";
+            json req = { {"@type","sendMessage"}, {"chat_id", g.id}, {"input_message_content", { {"@type","inputMessageText"}, {"text", { {"@type","formattedText"}, {"text", disc.str()} } } } } };
+            send(req.dump());
         }
 
-        logger_->warn("All attempts exhausted; failed to publish best triple");
-        append_audit("Failed to publish best triple after attempts");
-    } catch (const std::exception& ex) {
-        logger_->error(std::string("send_best3_dice_to_public exception: ") + ex.what());
+        if (auto_delete) {
+            bool ok = delete_private_messages(private_dice_group_id_, msg_ids);
+            if (ok) append_audit("Auto-deleted private rolls");
+            else append_audit("Auto-delete failed");
+        }
+
+        logger_->info("Completed send_best3_dice_to_public successfully");
+        return;
     }
 
-    if (logger_) logger_->info("[TRACE] send_best3_dice_to_public exited");
+    logger_->warn("All attempts exhausted; failed to publish best triple");
+    append_audit("Failed to publish best triple after attempts");
 }
 
 bool TelegramSession::delete_private_messages(int64_t chat_id, const std::vector<int64_t>& message_ids) {
@@ -936,19 +797,86 @@ json TelegramSession::copy_messages_to_public(int64_t from_chat_id, int64_t to_c
     return resp;
 }
 
-void TelegramSession::close() { stop_update_listener(); }
-void TelegramSession::switch_account(const std::string& new_phone) { (void)new_phone; }
+void TelegramSession::close() { 
+    stop_update_listener(); 
+#ifdef __unix__
+    s_control_server_running = false;
+    if (s_control_server_fd != -1) {
+        shutdown(s_control_server_fd, SHUT_RDWR);
+        ::close(s_control_server_fd);
+        s_control_server_fd = -1;
+    }
+#endif
+}
+
+void TelegramSession::switch_account(const std::string& new_phone) {
+    if (new_phone.empty()) {
+        logger_->error("switch_account: empty phone number");
+        return;
+    }
+    logger_->info("switch_account: switching to phone " + new_phone);
+    close();
+    submit_phone_async(new_phone);
+}
+
 void TelegramSession::set_session_suffix(const std::string& suffix) { session_suffix_ = suffix; }
-void TelegramSession::reset_session_files() { }
-void TelegramSession::remove_session() { }
-void TelegramSession::save_config() { }
+
+void TelegramSession::reset_session_files() {
+    try {
+        std::filesystem::remove_all("tdlib-data/" + session_suffix_);
+        logger_->info("reset_session_files: cleared session files for " + session_suffix_);
+    } catch (const std::exception& e) {
+        logger_->error("reset_session_files: failed to remove session files: " + std::string(e.what()));
+    }
+}
+
+void TelegramSession::remove_session() {
+    close();
+    reset_session_files();
+    authorized_ = false;
+    update_auth_stage(AuthStage::Closed);
+    logger_->info("remove_session: session removed");
+}
+
+void TelegramSession::save_config() {
+    try {
+        std::ofstream file("resources/config/config.json");
+        if (!file) {
+            logger_->error("save_config: failed to open config file");
+            return;
+        }
+        file << config_.dump(2);
+        logger_->info("save_config: configuration saved");
+    } catch (const std::exception& e) {
+        logger_->error("save_config: error: " + std::string(e.what()));
+    }
+}
 
 bool TelegramSession::is_authorized() const { return authorized_; }
 int64_t TelegramSession::get_own_user_id() { return 0; }
 bool TelegramSession::is_paused() const { return is_paused_; }
 void TelegramSession::pause_dice() { is_paused_ = true; }
 void TelegramSession::resume_dice() { is_paused_ = false; }
-void TelegramSession::parse_dice_command(const std::string& command) { (void)command; }
+
+void TelegramSession::parse_dice_command(const std::string& command) {
+    std::regex cmd_regex(R"(^([\x{1F3B2}-\x{1F3FF}]):(\d+):(-?\d+))",
+                         std::regex::ECMAScript | std::regex::icase | std::regex::optimize);
+    std::smatch match;
+    if (std::regex_match(command, match, cmd_regex)) {
+        std::string emoji = match[1];
+        int target = std::stoi(match[2]);
+        int64_t chat_id = std::stoll(match[3]);
+        set_dice_emoji(emoji);
+        if (g_handler) {
+            g_handler->process_dice_command(emoji, target, chat_id);
+            append_audit("Parsed dice command: " + command);
+        }
+    } else {
+        logger_->warn("parse_dice_command: invalid command format: " + command);
+        append_audit("Invalid dice command: " + command);
+    }
+}
+
 void TelegramSession::set_language(const std::string& lang_code) { system_language_code_ = lang_code; }
 
 int64_t TelegramSession::get_private_group_id() const { return private_dice_group_id_; }
@@ -987,3 +915,120 @@ void TelegramSession::append_audit(const std::string& s) {
     f << "[" << now_ts() << "] " << s << std::endl;
     f.flush();
 }
+
+std::vector<std::string> TelegramSession::get_audit_logs(int max_lines) {
+    std::vector<std::string> logs;
+    std::ifstream f("dice_rolls.log");
+    if (!f) {
+        logger_->error("get_audit_logs: failed to open dice_rolls.log");
+        return logs;
+    }
+    std::string line;
+    while (std::getline(f, line) && (max_lines <= 0 || logs.size() < static_cast<size_t>(max_lines))) {
+        logs.push_back(line);
+    }
+    return logs;
+}
+
+void TelegramSession::start_control_server() {
+#ifdef __unix__
+    if (s_control_server_running.load()) return;
+    s_control_server_running = true;
+    s_control_thread = std::thread([this]() {
+        int port = config_.value("control_port", 8879);
+        int srv = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (srv < 0) { if (logger_) logger_->error("control server: socket failed"); s_control_server_running = false; return; }
+        int one = 1; setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(port);
+        if (::bind(srv, (struct sockaddr*)&addr, sizeof(addr)) != 0) { 
+            ::close(srv); 
+            if (logger_) logger_->error("control server: bind failed on port " + std::to_string(port)); 
+            s_control_server_running = false; 
+            return; 
+        }
+        if (::listen(srv, 4) != 0) { ::close(srv); if (logger_) logger_->error("control server: listen failed"); s_control_server_running = false; return; }
+        s_control_server_fd = srv;
+        if (logger_) logger_->info("Control server running on port " + std::to_string(port));
+        while (s_control_server_running) {
+            struct sockaddr_in peer{}; socklen_t plen = sizeof(peer);
+            int fd = accept(srv, (struct sockaddr*)&peer, &plen);
+            if (fd < 0) { if (!s_control_server_running) break; sleep_ms(50); continue; }
+            std::string line;
+            char buf[1024];
+            ssize_t n;
+            struct timeval tv; tv.tv_sec = 5; tv.tv_usec = 0;
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) {
+                line.append(buf, buf + n);
+                if (!line.empty() && line.back() == '\n') break;
+                if (line.size() > 65536) break;
+            }
+            if (!line.empty() && line.back() == '\n') line.pop_back();
+            std::string reply;
+            try { 
+                reply = this->handle_control_command(line); 
+            } catch (const std::exception& ex) { 
+                json err; err["ok"]=false; err["error"]="handler_exception: " + std::string(ex.what()); reply = err.dump(); 
+            } catch (...) { 
+                json err; err["ok"]=false; err["error"]="unknown_exception"; reply = err.dump(); 
+            }
+            reply.push_back('\n');
+            ::send(fd, reply.data(), reply.size(), 0);
+            ::close(fd);
+        }
+        ::close(srv);
+        s_control_server_fd = -1;
+        if (logger_) logger_->info("Control server stopped");
+    });
+    s_control_thread.detach();
+#endif
+}
+
+void TelegramSession::stop_control_server() {
+#ifdef __unix__
+    s_control_server_running = false;
+    if (s_control_server_fd != -1) {
+        shutdown(s_control_server_fd, SHUT_RDWR);
+        ::close(s_control_server_fd);
+        s_control_server_fd = -1;
+    }
+#endif
+}
+
+std::string TelegramSession::handle_control_command(const std::string& line) {
+    try {
+        json req;
+        if (!line.empty() && (line.front() == '{' || line.front() == '[')) {
+            req = json::parse(line);
+            if (req.is_object() && req.contains("command") && req["command"].is_string()) {
+                std::string cmd = req["command"].get<std::string>();
+                if (cmd == "get_audit_logs") {
+                    int max_lines = req.value("max_lines", 100);
+                    auto logs = get_audit_logs(max_lines);
+                    json resp;
+                    resp["ok"] = true;
+                    resp["logs"] = logs;
+                    return resp.dump();
+                }
+                if (g_handler) g_handler->sendCommand(cmd);
+                json ok; ok["ok"]=true; return ok.dump();
+            }
+        }
+        if (!line.empty()) {
+            if (g_handler) g_handler->sendCommand(line);
+            json ok; ok["ok"]=true; return ok.dump();
+        }
+        json err; err["ok"]=false; err["error"]="empty_command";
+        return err.dump();
+    } catch (const std::exception& ex) {
+        json err; err["ok"]=false; err["error"]=std::string("exception: ")+ex.what();
+        return err.dump();
+    } catch (...) {
+        json err; err["ok"]=false; err["error"]="unknown_exception";
+        return err.dump();
+    }
+}
+
