@@ -1,8 +1,8 @@
+// socket_server.cpp
 #include "core/socket_server.hpp"
 #include "core/message_handler.hpp"
 #include "core/telegram_session.hpp"
 #include "core/logger.hpp"
-
 #include <iostream>
 #include <thread>
 #include <cstring>
@@ -10,20 +10,15 @@
 #include <unistd.h>
 #include <sstream>
 #include <nlohmann/json.hpp>
-
 // This is just a declaration; the definition is in main.cpp
 extern MessageHandler* g_handler;
-
 SocketServer::SocketServer(int port, std::shared_ptr<Logger> logger)
     : port_(port), logger_(logger), running_(false), server_fd_(-1) {}
-
 SocketServer::~SocketServer() { stop(); }
-
 void SocketServer::start() {
     running_ = true;
     server_thread_ = std::thread(&SocketServer::run, this);
 }
-
 void SocketServer::stop() {
     running_ = false;
     if (server_fd_ != -1) {
@@ -37,60 +32,57 @@ void SocketServer::stop() {
         logger_->info("SocketServer stopped");
     }
 }
-
 void SocketServer::run() {
     struct sockaddr_in address;
     int opt = 1;
     int addrlen = sizeof(address);
-
     if ((server_fd_ = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        if (logger_) {
-            logger_->error("Socket creation failed");
-        }
-        return;
-    }
-
-    if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
-        if (logger_) {
-            logger_->error("setsockopt failed");
-        }
-        return;
-    }
-
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port_);
-
-    if (bind(server_fd_, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        if (logger_) {
-            logger_->error("Bind failed");
-        }
-        return;
-    }
-
-    if (listen(server_fd_, 10) < 0) {
-        if (logger_) {
-            logger_->error("Listen failed");
-        }
-        return;
-    }
-
     if (logger_) {
-        logger_->info("SocketServer (TCP) starting on port " + std::to_string(port_));
+        logger_->error("Socket creation failed");
     }
-
-    while (running_) {
-        int new_socket = accept(server_fd_, (struct sockaddr *)&address, (socklen_t*)&addrlen);
-        if (new_socket < 0) {
-            if (running_ && logger_) {
-                logger_->error("Accept failed");
-            }
-            continue;
-        }
-        std::thread(&SocketServer::handle_client, this, new_socket).detach();
-    }
+    return;
 }
 
+if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+    if (logger_) {
+        logger_->error("setsockopt failed");
+    }
+    return;
+}
+
+address.sin_family = AF_INET;
+address.sin_addr.s_addr = INADDR_ANY;
+address.sin_port = htons(port_);
+
+if (bind(server_fd_, (struct sockaddr *)&address, sizeof(address)) < 0) {
+    if (logger_) {
+        logger_->error("Bind failed");
+    }
+    return;
+}
+
+if (listen(server_fd_, 10) < 0) {
+    if (logger_) {
+        logger_->error("Listen failed");
+    }
+    return;
+}
+
+if (logger_) {
+    logger_->info("SocketServer (TCP) starting on port " + std::to_string(port_));
+}
+
+while (running_) {
+    int new_socket = accept(server_fd_, (struct sockaddr *)&address, (socklen_t*)&addrlen);
+    if (new_socket < 0) {
+        if (running_ && logger_) {
+            logger_->error("Accept failed");
+        }
+        continue;
+    }
+    std::thread(&SocketServer::handle_client, this, new_socket).detach();
+}
+}
 void SocketServer::handle_client(int client_socket) {
     try {
         char buffer[4096] = {0};
@@ -103,22 +95,23 @@ void SocketServer::handle_client(int client_socket) {
         std::string command(buffer);
         // trim trailing newline/carriage returns
         while (!command.empty() && (command.back() == '\n' || command.back() == '\r')) command.pop_back();
-
         std::string response = process_command(command);
-        response += "\n";
-        send(client_socket, response.c_str(), response.size(), 0);
+    response += "\n";
+    send(client_socket, response.c_str(), response.size(), 0);
 
-    } catch (...) {}
-    close(client_socket);
+} catch (const std::exception& e) {
+    if (logger_) logger_->error("handle_client exception: " + std::string(e.what()));
+} catch (...) {
+    if (logger_) logger_->error("handle_client unknown exception");
 }
-
+close(client_socket);
+}
 std::string SocketServer::process_command(const std::string& cmd) {
     if (logger_) {
         logger_->info("Received command: " + cmd);
     }
-
     // Try to accept JSON objects (single-line) as well as plain text commands.
-    // UI sends JSON like: {"command":"dice","emoji":"🎲","allowed":"3,5,7"}
+    // UI sends JSON like: {"command":"dice","emoji":"","allowed":"3,5,7"}
     try {
         nlohmann::json j = nlohmann::json::parse(cmd);
         std::string command = j.value("command", std::string{});
@@ -140,6 +133,8 @@ std::string SocketServer::process_command(const std::string& cmd) {
             int per_dice_timeout_ms = j.value("per_dice_timeout_ms", 2000);
             int send_pacing_ms = j.value("send_pacing_ms", 1000);
             bool auto_delete = j.value("auto_delete_private", false);
+            int max_attempts = j.value("max_attempts", 3);
+            int auto_delete_delay_ms = j.value("auto_delete_delay_ms", 120000);
 
             std::set<int> allowed_set;
             if (!allowed.empty()) {
@@ -152,6 +147,15 @@ std::string SocketServer::process_command(const std::string& cmd) {
                 }
             }
             g_handler->set_allowed_sums(allowed_set);
+
+            if (!emoji.empty()) g_handler->session_.set_dice_emoji(emoji);
+
+            // Update config for the roll
+            g_handler->session_.config_["dice_count"] = total_rolls;
+            g_handler->session_.config_["dice_result_timeout_ms"] = per_dice_timeout_ms;
+            g_handler->session_.config_["auto_delete_private_rolls"] = auto_delete;
+            g_handler->session_.config_["max_attempts"] = max_attempts;
+            g_handler->session_.config_["auto_delete_delay_ms"] = auto_delete_delay_ms;
 
             // If MessageHandler supports parameterized call, forward values there.
             // Fallback to existing no-arg trigger.
@@ -195,6 +199,54 @@ std::string SocketServer::process_command(const std::string& cmd) {
             return std::string("Handler not available");
         }
 
+        if (command == "submit_code") {
+            std::string code = j.value("code", std::string{});
+            if (g_handler) { try { g_handler->submit_code(code); } catch(...) {} nlohmann::json r; r["ok"]=true; r["event"]="code_submitted"; return r.dump(); }
+            return std::string("Handler not available");
+        }
+
+        if (command == "submit_password") {
+            std::string password = j.value("password", std::string{});
+            if (g_handler) { try { g_handler->submit_password(password); } catch(...) {} nlohmann::json r; r["ok"]=true; r["event"]="password_submitted"; return r.dump(); }
+            return std::string("Handler not available");
+        }
+
+        if (command == "status") {
+            if (g_handler) {
+                nlohmann::json resp;
+                g_handler->get_status(resp);
+                resp["ok"] = true;
+                return resp.dump();
+            }
+            return std::string("Handler not available");
+        }
+
+        if (command == "pause") {
+            if (g_handler) { g_handler->session_.pause_dice(); nlohmann::json r; r["ok"]=true; r["event"]="paused"; return r.dump(); }
+            return std::string("Handler not available");
+        }
+
+        if (command == "resume") {
+            if (g_handler) { g_handler->session_.resume_dice(); nlohmann::json r; r["ok"]=true; r["event"]="resumed"; return r.dump(); }
+            return std::string("Handler not available");
+        }
+
+        if (command == "set_allowed") {
+            std::string allowed = j.value("allowed", std::string{});
+            std::set<int> allowed_set;
+            if (!allowed.empty()) {
+                std::stringstream ss(allowed);
+                std::string token;
+                while (std::getline(ss, token, ',')) {
+                    try {
+                        allowed_set.insert(std::stoi(token));
+                    } catch (...) {}
+                }
+            }
+            if (g_handler) { g_handler->set_allowed_sums(allowed_set); nlohmann::json r; r["ok"]=true; return r.dump(); }
+            return std::string("Handler not available");
+        }
+
         return std::string("Unknown JSON command: ") + command;
     } catch (const nlohmann::json::parse_error&) {
         // Not JSON — fall back to legacy plain-text handling
@@ -212,8 +264,9 @@ std::string SocketServer::process_command(const std::string& cmd) {
             return "Handler not available";
         }
         return "Unknown command: " + cmd;
+    } catch (const std::exception& e) {
+        return "Error processing command: " + std::string(e.what());
     } catch (...) {
-        return "Error processing command";
+        return "Unknown error processing command";
     }
 }
-
