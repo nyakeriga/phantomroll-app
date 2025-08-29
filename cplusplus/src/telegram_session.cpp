@@ -1,10 +1,54 @@
+
+
+#include "core/telegram_session.hpp"
+
+// --- Dice roll buffer for last 10 real dice values ---
+void TelegramSession::collectDiceRoll10(int value) {
+    if (value < 1 || value > 6) {
+        // ignore -1 or invalid values
+        return;
+    }
+    last10Dice.push_back(value);
+    if (last10Dice.size() > 10) {
+        last10Dice.pop_front();
+    }
+}
+
+std::optional<int> TelegramSession::computeBestTripleFrom10() {
+    if (last10Dice.size() < 3) {
+        return std::nullopt; // not enough data yet
+    }
+    int bestSum = -1;
+    for (size_t i = 0; i < last10Dice.size(); i++) {
+        for (size_t j = i + 1; j < last10Dice.size(); j++) {
+            for (size_t k = j + 1; k < last10Dice.size(); k++) {
+                int sum = last10Dice[i] + last10Dice[j] + last10Dice[k];
+                if (sum > bestSum) {
+                    bestSum = sum;
+                }
+            }
+        }
+    }
+    return std::make_optional(bestSum);
+}
+
+// #include <nlohmann/json.hpp> // removed duplicate, included below after all system headers
+// Unified event sender for GUI (stdout, replace with socket if needed)
+inline void send_event_to_gui(const std::string& event, const nlohmann::json& data = nlohmann::json()) {
+    nlohmann::json j;
+    j["event"] = event;
+    if (!data.is_null() && !data.empty()) j["data"] = data;
+    std::cout << j.dump() << std::endl;
+    std::cout.flush();
+}
+
 // telegram_session.cpp
 // ----------------------------------------------------------------------------
 // PhantomRoll – Telegram Session implementation
 // ----------------------------------------------------------------------------
-
 #include "core/telegram_session.hpp"
-#include "core/message_handler.hpp"
+#include <mutex>
+#include "core/message_handler.hpp" 
 #include <td/telegram/td_api.h>
 #include <td/telegram/td_json_client.h>
 #include <iostream>
@@ -22,7 +66,8 @@
 #include <optional>
 #include <tuple>
 #include <array>
-#include <nlohmann/json.hpp>
+
+
 #include <vector>
 #include <set>
 #include <numeric>
@@ -38,7 +83,8 @@
 #include <regex> // IMPROVEMENT: Added for regex functionality
 
 #include "core/logger.hpp"
-using json = nlohmann::json;
+
+using nlohmann::json;
 
 using namespace std::literals::chrono_literals;
 
@@ -61,7 +107,7 @@ extern MessageHandler* g_handler;
 // static control-server globals (keeps header changes optional)
 static std::atomic<bool> s_control_server_running{false};
 static std::thread s_control_thread;
-static int s_control_server_fd = -1;
+int s_control_server_fd = -1;
 
 // ----------------- internal helpers & anonymous namespace -----------------
 namespace {
@@ -130,21 +176,52 @@ namespace {
         return bt;
     }
 
+
     int simulate_best_sum_once(int N, const std::set<int>& allowed, std::mt19937_64& rng) {
         std::vector<int> V; V.reserve(N);
         for (int t=0;t<N;++t) V.push_back(roll_die(rng));
         auto bt = best_triple_from_vector(V, allowed);
         return bt.found ? bt.sum : -1;
     }
+} // end anonymous namespace
+
+// Static wrappers for demo use in main.cpp
+std::size_t TelegramSession::hash_allowed_for_demo(const std::set<int>& S) { return ::hash_allowed(S); }
+int TelegramSession::simulate_best_sum_once_for_demo(int N, const std::set<int>& allowed, std::mt19937_64& rng) { return ::simulate_best_sum_once(N, allowed, rng); }
+
+// Comment out unused function to suppress warning
+/*
+double estimate_expected_best_sum_m(int N, the std::set<int>& allowed, int m_attempts, int trials = 3000) {
+    if (m_attempts <= 0) return -1.0;
+    static std::unordered_map<uint64_t,double> cache;
+    uint64_t key = (uint64_t(N) & 0xffff)
+                 | (uint64_t(m_attempts) & 0xffff) << 16
+                 | (uint64_t(hash_allowed(allowed)) << 32);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+
+    std::mt19937_64 rng{std::random_device{}()};
+    long long acc = 0;
+    int valid = 0;
+    for (int t=0;t<trials;++t) {
+        int best = -1;
+        for (int a=0;a<m_attempts;++a) {
+            int s = simulate_best_sum_once(N, allowed, rng);
+            if (s > best) best = s;
+        }
+        if (best >= 0) { acc += best; ++valid; }
+    }
+    double ev = (valid > 0) ? double(acc) / valid : -1.0;
+    cache[key] = ev;
+    return ev;
+}
+*/
 
     bool json_has_extra(const json& j, const std::string& extra) {
         return j.contains("@extra") && j["@extra"].is_string() && j["@extra"].get<std::string>() == extra;
     }
-}
 
 // ----------------- dice result tracking globals -----------------
-struct DiceKey { int64_t chat_id; int64_t msg_id; bool operator==(DiceKey const& o) const { return chat_id==o.chat_id && msg_id==o.msg_id; } };
-struct DiceKeyHash { std::size_t operator()(DiceKey const& k) const noexcept { return std::hash<int64_t>()(k.chat_id ^ (k.msg_id<<1)); } };
 static std::unordered_map<DiceKey,int,DiceKeyHash> g_dice_values;
 static std::mutex g_dice_mtx;
 static std::condition_variable g_dice_cv;
@@ -174,10 +251,10 @@ static nlohmann::json request_with_extra_blocking(TelegramSession* self, nlohman
 // ----------------- TelegramSession implementation -----------------
 
 TelegramSession::TelegramSession()
-: client_(nullptr)
-, logger_(std::make_unique<Logger>(Logger::Level::INFO))
-, authorized_(false)
-, listening_(false)
+    : client_(nullptr)
+    , logger_(std::make_unique<Logger>(Logger::Level::INFO))
+    , authorized_(false)
+    , listening_(false)
 , stop_update_listener_flag_(false)
 , current_auth_stage_(AuthStage::None)
 , api_id_(0)
@@ -198,6 +275,7 @@ TelegramSession::~TelegramSession() {
 }
 
 void TelegramSession::initialize(const nlohmann::json& config_override) {
+    std::string config_path = "(override)";
     if (!config_override.is_null() && !config_override.empty()) {
         config_ = config_override;
     } else {
@@ -207,7 +285,16 @@ void TelegramSession::initialize(const nlohmann::json& config_override) {
             throw std::runtime_error(" Failed to open fallback config: " + fallback_path);
         }
         file >> config_;
+        config_path = fallback_path;
         std::cout << "[DEBUG] Loaded fallback config from: " << fallback_path << std::endl;
+    }
+
+    // Log the loaded private_dice_group_id_ value and config path
+    std::cout << "[DEBUG] Config path: " << config_path << std::endl;
+    if (config_.contains("private_dice_group_id")) {
+        std::cout << "[DEBUG] Config private_dice_group_id: " << config_["private_dice_group_id"] << std::endl;
+    } else {
+        std::cout << "[DEBUG] Config has NO private_dice_group_id!" << std::endl;
     }
 
     // Validate config
@@ -313,71 +400,82 @@ bool TelegramSession::authenticate() {
         use_external_auth = config_["external_auth"].get<bool>();
     }
 
-    if (use_external_auth) {
-        logger_->info("authenticate(): expecting external TDLib auth flow");
-        return true;
-    }
-
-    logger_->info("authenticate(): starting automated TDLib auth");
-
+    // Only accept login/phone/code from GUI via JSON commands.
     sendTdlibParameters();
-
-    std::string phone = config_.value("phone_number", "");
-    std::string code = config_.value("login_code", "");
-
-    if (phone.empty()) {
-        std::cout << "Enter your phone number (e.g., +13522070047): ";
-        std::getline(std::cin, phone);
-    }
-    if (phone.empty()) phone = phone_number_;
-    submit_phone_async(phone);
-
-    if (code.empty()) {
-        std::cout << "Enter login code / 2FA (or 'exit'): ";
-        std::getline(std::cin, code);
-        if (code == "exit") {
-            logger_->info("Authentication cancelled");
-            return false;
-        }
-    }
-    submit_code_async(code);
-
+    // Notify GUI to prompt for phone and code as needed.
+    // (Implementation: send status/event JSON to GUI socket)
+    // Do not prompt or log here; GUI handles all user interaction and logging.
     return true;
 }
 
 void TelegramSession::forceLogin() { 
-    logger_->info("forceLogin() called"); 
+    // GUI handles forceLogin; no logging here
 }
 
 void TelegramSession::submit_phone_async(const std::string& phone) {
     std::string clean_phone = trim(phone);
     if (clean_phone.empty()) {
-        logger_->error("submit_phone_async: phone number is empty after trimming");
+        send_event_to_gui("auth_status", nlohmann::json{{"status", "error"}, {"detail", "empty_phone"}});
+        logger_->error("submit_phone_async: empty phone received");
         return;
     }
     current_phone_ = clean_phone;
     json req = { {"@type","setAuthenticationPhoneNumber"}, {"phone_number", clean_phone} };
-    request_with_extra_blocking(this, req, "auth_phone:" + rand_token(), 10.0);
+    logger_->info("submit_phone_async: sending setAuthenticationPhoneNumber to TDLib for phone: " + clean_phone);
+    auto resp = request_with_extra_blocking(this, req, "auth_phone:" + rand_token(), 10.0);
+    if (!resp.is_object()) {
+        logger_->error("submit_phone_async: No response from TDLib after sending phone");
+        send_event_to_gui("auth_status", nlohmann::json{{"status", "error"}, {"detail", "No response from Telegram after submitting phone"}});
+        return;
+    }
+    if (resp.contains("@type") && resp["@type"] == "error") {
+        logger_->error("submit_phone_async: TDLib error: " + resp.dump());
+        send_event_to_gui("auth_status", nlohmann::json{{"status", "error"}, {"detail", resp.dump()}});
+        return;
+    }
+    logger_->info("submit_phone_async: Phone submitted, waiting for code");
+    send_event_to_gui("auth_status", nlohmann::json{{"status", "waiting_code"}, {"detail", "Phone submitted, waiting for code"}});
 }
 
 void TelegramSession::submit_code_async(const std::string& code) {
     std::string clean_code = trim(code);
     if (clean_code.empty()) {
-        logger_->error("submit_code_async: code is empty after trimming");
+        send_event_to_gui("auth_status", nlohmann::json{{"status", "error"}, {"detail", "empty_code"}});
         return;
     }
     json req = { {"@type","checkAuthenticationCode"}, {"code", clean_code} };
-    request_with_extra_blocking(this, req, "auth_code:" + rand_token(), 10.0);
+    auto resp = request_with_extra_blocking(this, req, "auth_code:" + rand_token(), 10.0);
+    // Check if login is now ready or if password is needed
+    if (resp.is_object() && resp.contains("@type")) {
+        std::string tp = resp["@type"].get<std::string>();
+        if (tp == "ok" || tp == "authorizationStateReady") {
+            authorized_ = true;
+            update_auth_stage(AuthStage::Ready);
+            send_event_to_gui("auth_status", nlohmann::json{{"status", "authorized"}, {"detail", "Authorization ready"}});
+            send_event_to_gui("login_success", nlohmann::json{{"message", "Successfully logged in"}});
+            return;
+        } else if (tp == "authorizationStateWaitPassword") {
+            send_event_to_gui("auth_status", nlohmann::json{{"status", "waiting_password"}, {"detail", "Code submitted, waiting for password"}});
+            update_auth_stage(AuthStage::WaitPassword);
+            return;
+        } else if (tp == "error") {
+            send_event_to_gui("auth_status", nlohmann::json{{"status", "error"}, {"detail", resp.dump()}});
+            return;
+        }
+    }
+    // Fallback: if we don't know, just say waiting for password
+    send_event_to_gui("auth_status", nlohmann::json{{"status", "waiting_password"}, {"detail", "Code submitted, waiting for password if needed"}});
 }
 
 void TelegramSession::submit_2fa_async(const std::string& password) {
     std::string clean_pwd = trim(password);
     if (clean_pwd.empty()) {
-        logger_->error("submit_2fa_async: password is empty after trimming");
+        send_event_to_gui("auth_status", nlohmann::json{{"status", "error"}, {"detail", "empty_password"}});
         return;
     }
     json req = { {"@type","checkAuthenticationPassword"}, {"password", clean_pwd} };
     request_with_extra_blocking(this, req, "auth_pwd:" + rand_token(), 10.0);
+    send_event_to_gui("auth_status", nlohmann::json{{"status", "auth_checking"}, {"detail", "Password submitted, checking..."}});
 }
 
 void TelegramSession::submit_code(const std::string& code) { submit_code_async(code); }
@@ -475,12 +573,17 @@ void TelegramSession::handle_update(const json& update) {
             const auto& content = m["content"];
             if (content.contains("@type") && content["@type"] == "messageDice" && content.contains("value")) {
                 int value = content["value"].get<int>();
-                {
+                if (value >= 1 && value <= 6) {
                     std::lock_guard<std::mutex> lk(g_dice_mtx);
                     g_dice_values[{chat_id,msg_id}] = value;
+                    g_dice_cv.notify_all();
+                    append_audit("Received dice result chat=" + std::to_string(chat_id) + " msg=" + std::to_string(msg_id) + " value=" + std::to_string(value));
+                    // Send dice result event to GUI
+                    nlohmann::json data = { {"chat_id", chat_id}, {"msg_id", msg_id}, {"value", value} };
+                    send_event_to_gui("dice_result", data);
+                } else {
+                    append_audit("Ignored dice result with invalid value=" + std::to_string(value) + " for chat=" + std::to_string(chat_id) + " msg=" + std::to_string(msg_id));
                 }
-                g_dice_cv.notify_all();
-                append_audit("Received dice result chat=" + std::to_string(chat_id) + " msg=" + std::to_string(msg_id) + " value=" + std::to_string(value));
             }
         }
         return;
@@ -493,12 +596,16 @@ void TelegramSession::handle_update(const json& update) {
             const auto& content = update["new_content"];
             if (content.contains("@type") && content["@type"] == "messageDice" && content.contains("value")) {
                 int value = content["value"].get<int>();
-                {
+                if (value >= 1 && value <= 6) {
                     std::lock_guard<std::mutex> lk(g_dice_mtx);
                     g_dice_values[{chat_id,msg_id}] = value;
+                    g_dice_cv.notify_all();
+                    append_audit("Received edited dice content chat=" + std::to_string(chat_id) + " msg=" + std::to_string(msg_id) + " value=" + std::to_string(value));
+                    nlohmann::json data = { {"chat_id", chat_id}, {"msg_id", msg_id}, {"value", value}, {"edited", true} };
+                    send_event_to_gui("dice_result", data);
+                } else {
+                    append_audit("Ignored edited dice content with invalid value=" + std::to_string(value) + " for chat=" + std::to_string(chat_id) + " msg=" + std::to_string(msg_id));
                 }
-                g_dice_cv.notify_all();
-                append_audit("Received edited dice content chat=" + std::to_string(chat_id) + " msg=" + std::to_string(msg_id) + " value=" + std::to_string(value));
             }
         }
         return;
@@ -506,19 +613,40 @@ void TelegramSession::handle_update(const json& update) {
 }
 
 void TelegramSession::handle_auth_update(const json& st) {
-    if (!st.is_object() || !st.contains("@type")) return;
+    if (!st.is_object() || !st.contains("@type")) {
+        logger_->error("handle_auth_update: invalid or missing @type in state: " + st.dump());
+        return;
+    }
     std::string tp = st["@type"].get<std::string>();
+    logger_->info("handle_auth_update: received state: " + tp);
     if (tp == "authorizationStateReady") {
         authorized_ = true;
         update_auth_stage(AuthStage::Ready);
         logger_->info("Authorization ready");
+        send_event_to_gui("auth_status", nlohmann::json{{"status", "authorized"}, {"detail", "Authorization ready"}});
+        // Send explicit login success event for GUI
+        send_event_to_gui("login_success", nlohmann::json{{"message", "Successfully logged in"}});
     } else if (tp == "authorizationStateClosed") {
         authorized_ = false;
         update_auth_stage(AuthStage::Closed);
         logger_->warn("Authorization closed");
-    } else if (tp == "authorizationStateWaitPhoneNumber") update_auth_stage(AuthStage::WaitPhoneNumber);
-    else if (tp == "authorizationStateWaitCode") update_auth_stage(AuthStage::WaitCode);
-    else if (tp == "authorizationStateWaitPassword") update_auth_stage(AuthStage::WaitPassword);
+        send_event_to_gui("auth_status", nlohmann::json{{"status", "closed"}, {"detail", "Authorization closed"}});
+    } else if (tp == "authorizationStateWaitPhoneNumber") {
+        logger_->info("handle_auth_update: Waiting for phone number");
+        send_event_to_gui("auth_status", nlohmann::json{{"status", "waiting_phone"}, {"detail", "Waiting for phone number"}});
+        update_auth_stage(AuthStage::WaitPhoneNumber);
+    } else if (tp == "authorizationStateWaitCode") {
+        logger_->info("handle_auth_update: Waiting for code");
+        send_event_to_gui("auth_status", nlohmann::json{{"status", "waiting_code"}, {"detail", "Waiting for code"}});
+        update_auth_stage(AuthStage::WaitCode);
+    } else if (tp == "authorizationStateWaitPassword") {
+        logger_->info("handle_auth_update: Waiting for password");
+        send_event_to_gui("auth_status", nlohmann::json{{"status", "waiting_password"}, {"detail", "Waiting for password"}});
+        update_auth_stage(AuthStage::WaitPassword);
+    } else {
+        logger_->warn("handle_auth_update: Unhandled state: " + tp);
+        send_event_to_gui("auth_status", nlohmann::json{{"status", "unknown_state"}, {"detail", st.dump()}});
+    }
 }
 
 void TelegramSession::update_auth_stage(AuthStage s) {
@@ -561,54 +689,139 @@ void TelegramSession::stop_update_listener() {
     listening_ = false;
 }
 
+// Production: cache forum info, robust error handling, clear logging
 int TelegramSession::sendDice(int64_t chat_id, int /*dice_value*/) {
+    static std::unordered_map<int64_t, std::pair<bool, int64_t>> forum_cache; // chat_id -> (is_forum, message_thread_id)
+    std::string emoji = dice_emoji_.empty() ? "🎲" : dice_emoji_;
+    logger_->info("[PROD] Attempting to send dice: chat_id=" + std::to_string(chat_id) + ", emoji='" + emoji + "'");
+
+    bool is_forum = false;
+    int64_t message_thread_id = 0;
+    // Check cache first
+    auto it = forum_cache.find(chat_id);
+    if (it != forum_cache.end()) {
+        is_forum = it->second.first;
+        message_thread_id = it->second.second;
+    } else {
+        try {
+            nlohmann::json chat_req = {
+                {"@type", "getChat"},
+                {"chat_id", chat_id}
+            };
+            std::string extra = "getforum:" + std::to_string(chat_id) + ":" + rand_token();
+            nlohmann::json chat_resp = request_with_extra_blocking(this, chat_req, extra, 10.0);
+            if (chat_resp.is_object() && chat_resp.contains("type") && chat_resp["type"].is_object()) {
+                auto& type = chat_resp["type"];
+                if (type.contains("@type") && type["@type"] == "chatTypeSupergroup") {
+                    if (type.contains("is_forum")) {
+                        is_forum = type["is_forum"].get<bool>();
+                    }
+                }
+            }
+            if (is_forum) {
+                if (chat_resp.contains("message_thread_id")) {
+                    message_thread_id = chat_resp["message_thread_id"].get<int64_t>();
+                } else {
+                    message_thread_id = chat_id; // fallback
+                }
+            }
+            forum_cache[chat_id] = std::make_pair(is_forum, message_thread_id);
+        } catch (const std::exception& e) {
+            logger_->error(std::string("[PROD] sendDice: error checking forum info: ") + e.what());
+        }
+    }
+
     json req = {
         {"@type","sendMessage"},
         {"chat_id", chat_id},
-        {"input_message_content", { {"@type","inputMessageDice"}, {"emoji", dice_emoji_} }}
+        {"input_message_content", { {"@type","inputMessageDice"}, {"emoji", emoji} }}
     };
+    // Do NOT set "value" here. Telegram will ignore it; the real value comes in updateMessageContent.
+    if (is_forum && message_thread_id != 0) {
+        req["message_thread_id"] = message_thread_id;
+        logger_->info("[PROD] Sending dice to forum thread: " + std::to_string(message_thread_id));
+    }
+
     std::string extra = "senddice:" + std::to_string(chat_id) + ":" + rand_token();
     json resp = request_with_extra_blocking(this, req, extra, 10.0);
-    if (!resp.is_object()) { logger_->error("sendDice: timeout"); append_audit("sendDice timeout chat=" + std::to_string(chat_id)); return 0; }
-    if (resp.contains("@type") && resp["@type"] == "error") { logger_->error("sendDice error: " + resp.dump()); append_audit("sendDice error: " + resp.dump()); return 0; }
+    logger_->info("[PROD] TDLib response for sendDice: " + resp.dump());
+    if (!resp.is_object()) {
+        logger_->error("[PROD] sendDice: timeout");
+        append_audit("sendDice timeout chat=" + std::to_string(chat_id));
+        send_event_to_gui("dice_send_failed", { {"chat_id", chat_id}, {"detail", "Timeout sending dice to chat"} });
+        return 0;
+    }
+    if (resp.contains("@type") && resp["@type"] == "error") {
+        logger_->error("[PROD] sendDice error: " + resp.dump());
+        append_audit("sendDice error: " + resp.dump());
+        send_event_to_gui("dice_send_failed", { {"chat_id", chat_id}, {"detail", resp.dump()} });
+        return 0;
+    }
     if (resp.contains("@type") && resp["@type"] == "message" && resp.contains("id")) {
         int64_t mid = resp["id"].get<int64_t>();
         append_audit("Sent dice chat=" + std::to_string(chat_id) + " msg=" + std::to_string(mid));
+        send_event_to_gui("dice_sent", { {"chat_id", chat_id}, {"msg_id", mid}, {"detail", "Dice sent successfully"} });
         return static_cast<int>(mid);
     }
+    send_event_to_gui("dice_send_failed", { {"chat_id", chat_id}, {"detail", "Unknown error sending dice"} });
     return 0;
 }
 
 int TelegramSession::waitForDiceValue(int64_t chat_id, int msg_id, int timeout_ms) {
     std::unique_lock<std::mutex> lk(g_dice_mtx);
     DiceKey key{chat_id, (int64_t)msg_id};
-    auto pred = [&](){ return g_dice_values.find(key) != g_dice_values.end(); };
-    if (!g_dice_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), pred)) return -1;
-    return g_dice_values[key];
+    auto pred = [&](){
+        auto it = g_dice_values.find(key);
+        return it != g_dice_values.end() && it->second >= 1 && it->second <= 6;
+    };
+    bool got = g_dice_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), pred);
+    if (!got) {
+        logger_->warn("[DICE] waitForDiceValue: Timed out waiting for dice value for chat_id=" + std::to_string(chat_id) + ", msg_id=" + std::to_string(msg_id));
+        append_audit("[DICE] waitForDiceValue: Timed out waiting for dice value for chat_id=" + std::to_string(chat_id) + ", msg_id=" + std::to_string(msg_id));
+        return -1;
+    }
+    int value = g_dice_values[key];
+    logger_->info("[DICE] waitForDiceValue: Got value=" + std::to_string(value) + " for chat_id=" + std::to_string(chat_id) + ", msg_id=" + std::to_string(msg_id));
+    append_audit("[DICE] waitForDiceValue: Got value=" + std::to_string(value) + " for chat_id=" + std::to_string(chat_id) + ", msg_id=" + std::to_string(msg_id));
+    return value;
 }
 
-std::vector<int64_t> TelegramSession::sendDiceBatch(int64_t chat_id, int count, int pacing_ms, const std::string& emoji) {
+
+std::vector<DiceKey> TelegramSession::sendDiceBatch(int64_t chat_id, int count, int pacing_ms, const std::string& emoji) {
     std::string saved = dice_emoji_;
-    if (!emoji.empty()) dice_emoji_ = emoji;
-    std::vector<int64_t> ids; ids.reserve(count);
+    if (!emoji.empty()) {
+        dice_emoji_ = emoji;
+    } else if (dice_emoji_.empty()) {
+        dice_emoji_ = "🎲";
+    }
+    std::vector<DiceKey> keys; keys.reserve(count);
     for (int i=0;i<count;++i) {
         int id = sendDice(chat_id);
-        ids.push_back((int64_t)id);
+        keys.push_back(DiceKey{chat_id, (int64_t)id});
         if (pacing_ms > 0) sleep_ms(pacing_ms);
     }
     if (!emoji.empty()) dice_emoji_ = saved;
-    return ids;
+    return keys;
 }
 
-std::vector<int> TelegramSession::waitForDiceResults(int64_t chat_id, const std::vector<int64_t>& message_ids, int per_dice_timeout_ms) {
-    std::vector<int> vals; vals.reserve(message_ids.size());
-    for (auto m : message_ids) vals.push_back(waitForDiceValue(chat_id, (int)m, per_dice_timeout_ms));
+
+std::vector<int> TelegramSession::waitForDiceResults(const std::vector<DiceKey>& dice_keys, int per_dice_timeout_ms) {
+    std::vector<int> vals; vals.reserve(dice_keys.size());
+    for (const auto& key : dice_keys) {
+        vals.push_back(waitForDiceValue(key.chat_id, (int)key.msg_id, per_dice_timeout_ms));
+    }
     return vals;
 }
 
 std::optional<std::tuple<int,int,int>> TelegramSession::pick_best_triple(const std::array<int,10>& dice_values) const {
     std::vector<int> vec(dice_values.begin(), dice_values.end());
     const auto& allowed = valid_sums_.empty() ? allowed_sums_ : valid_sums_;
+    std::cout << "[DEBUG] Dice values: ";
+    for (int v : vec) std::cout << v << " ";
+    std::cout << std::endl;
+    std::cout << "[DEBUG] Allowed sums: ";
+    for (int s : allowed) std::cout << s << " ";
+    std::cout << std::endl;
     BestTriple bt = best_triple_from_vector(vec, allowed);
     if (!bt.found) return std::nullopt;
     return std::make_tuple(bt.i, bt.j, bt.k);
@@ -616,6 +829,12 @@ std::optional<std::tuple<int,int,int>> TelegramSession::pick_best_triple(const s
 
 std::vector<int> TelegramSession::pick_best_triple(const std::vector<int>& dice_values) const {
     const auto& allowed = valid_sums_.empty() ? allowed_sums_ : valid_sums_;
+    std::cout << "[DEBUG] Dice values: ";
+    for (int v : dice_values) std::cout << v << " ";
+    std::cout << std::endl;
+    std::cout << "[DEBUG] Allowed sums: ";
+    for (int s : allowed) std::cout << s << " ";
+    std::cout << std::endl;
     BestTriple bt = best_triple_from_vector(dice_values, allowed);
     if (!bt.found) {
         return {};
@@ -625,14 +844,26 @@ std::vector<int> TelegramSession::pick_best_triple(const std::vector<int>& dice_
 
 void TelegramSession::on_update(const nlohmann::json& update) {
     try {
+        // Log every update received from TDLib for debugging
+        std::cout << "[TDLIB-UPDATE] " << update.dump() << std::endl;
+
+
         if (!update.contains("@type")) return;
 
         const std::string& type = update["@type"].get<std::string>();
 
+        // --- Robust dice value extraction and logging ---
+        auto store_dice_value = [](int64_t chat_id, int64_t msg_id, int value, const char* src) {
+            std::lock_guard<std::mutex> lk(g_dice_mtx);
+            g_dice_values[{chat_id, msg_id}] = value;
+            g_dice_cv.notify_all();
+            std::cout << "[DICE] " << src << ": Stored dice value " << value << " for (chat_id=" << chat_id << ", msg_id=" << msg_id << ")" << std::endl;
+        };
+
         if (type == "updateNewMessage") {
             const auto& msg = update.value("message", json{});
-            std::cout << "[UPDATE] New message from chat " 
-                      << msg.value("chat_id", 0) 
+            std::cout << "[UPDATE] New message from chat "
+                      << msg.value("chat_id", 0)
                       << ": " << msg.dump() << std::endl;
 
             {
@@ -641,6 +872,62 @@ void TelegramSession::on_update(const nlohmann::json& update) {
                 if (last_private_msgs_.size() > 100) last_private_msgs_.erase(last_private_msgs_.begin());
             }
 
+            // If this message is a dice roll, update the last10Dice buffer
+            if (msg.contains("content") && msg["content"].contains("@type") && msg["content"]["@type"] == "messageDice") {
+                int value = -1;
+                bool found_direct = false, found_nested = false;
+                if (msg["content"].contains("value")) {
+                    value = msg["content"]["value"].get<int>();
+                    found_direct = true;
+                } else if (msg["content"].contains("dice") && msg["content"]["dice"].contains("value")) {
+                    value = msg["content"]["dice"]["value"].get<int>();
+                    found_nested = true;
+                }
+                std::cout << "[DEBUG] Dice message received: value=" << value << ", found_direct=" << found_direct << ", found_nested=" << found_nested << ", msg=" << msg.dump() << std::endl;
+
+                // --- Store dice value for waitForDiceValue ---
+                if (msg.contains("chat_id") && msg.contains("id")) {
+                    int64_t chat_id = msg["chat_id"].get<int64_t>();
+                    int64_t msg_id = msg["id"].get<int64_t>();
+                    if (value >= 1 && value <= 6) {
+                        store_dice_value(chat_id, msg_id, value, "updateNewMessage");
+                    } else {
+                        std::cout << "[DEBUG] Invalid dice value received (not 1-6): " << value << ". chat_id=" << chat_id << ", msg_id=" << msg_id << std::endl;
+                    }
+                } else {
+                    std::cout << "[DEBUG] Dice message missing chat_id or id: " << msg.dump() << std::endl;
+                }
+
+                if (value >= 1 && value <= 6) {
+                    collectDiceRoll10(value);
+                    std::cout << "[BUFFER] Added dice value to last10Dice: " << value << std::endl;
+                    // Trigger best triple calculation
+                    auto best = computeBestTripleFrom10();
+                    if (best) {
+                        std::cout << "[TRIPLE] Best triple sum from last 10: " << *best << std::endl;
+                    } else {
+                        std::cout << "[TRIPLE] Not enough dice to compute best triple." << std::endl;
+                    }
+                } else {
+                    std::cout << "[DEBUG] Dice value not added to last10Dice: " << value << std::endl;
+                }
+            }
+
+        } else if (type == "updateMessageContent") {
+            if (update.contains("chat_id") && update.contains("message_id")) {
+                int64_t chat_id = update["chat_id"].get<int64_t>();
+                int64_t msg_id  = update["message_id"].get<int64_t>();
+                const auto& content = update["new_content"];
+                if (content.contains("@type") && content["@type"] == "messageDice" && content.contains("value")) {
+                    int value = content["value"].get<int>();
+                    if (value >= 1 && value <= 6) {
+                        store_dice_value(chat_id, msg_id, value, "updateMessageContent");
+                    } else {
+                        std::cout << "[DEBUG] Invalid dice value in updateMessageContent (not 1-6): " << value << ". chat_id=" << chat_id << ", msg_id=" << msg_id << std::endl;
+                    }
+                }
+            }
+            return;
         } else if (type == "updateMessageSendSucceeded") {
         } else if (type == "updateMessageSendFailed") {
             std::cerr << "[WARN] Message send failed: " << update.dump() << std::endl;
@@ -671,99 +958,252 @@ void TelegramSession::on_update(const nlohmann::json& update) {
 }
 
 void TelegramSession::send_best3_dice_to_public() {
+    logger_->info("[DEBUG] send_best3_dice_to_public called");
+    send_event_to_gui("dice_batch_start", nlohmann::json{});
     if (!config_.value("enable_auto_publish", false)) {
         logger_->info("send_best3_dice_to_public: auto publish disabled by config");
         append_audit("Auto-publish disabled; skipping send_best3_dice_to_public");
         return;
     }
 
-    if (is_paused_) { logger_->warn("send_best3_dice_to_public: paused"); return; }
-    if (!authorized_) { logger_->warn("send_best3_dice_to_public: not authorized"); return; }
-    if (private_dice_group_id_ == 0) { logger_->error("private group not configured"); return; }
-    if (public_groups_.empty()) { logger_->error("no public groups configured"); return; }
+    if (is_paused_) {
+        logger_->warn("send_best3_dice_to_public: paused");
+        append_audit("[DEBUG] send_best3_dice_to_public: paused");
+        return;
+    }
+    if (!authorized_) {
+        logger_->warn("send_best3_dice_to_public: not authorized");
+        append_audit("[DEBUG] send_best3_dice_to_public: not authorized");
+        return;
+    }
+    logger_->info("[DEBUG] Using private_dice_group_id_=" + std::to_string(private_dice_group_id_));
+    append_audit("[DEBUG] Using private_dice_group_id_=" + std::to_string(private_dice_group_id_));
+    if (private_dice_group_id_ == 0) {
+        logger_->error("private group not configured");
+        append_audit("[DEBUG] private group not configured");
+        return;
+    }
+    if (public_groups_.empty()) {
+        logger_->error("no public groups configured");
+        append_audit("[DEBUG] no public groups configured");
+        return;
+    }
+
+    // Check if bot has access to private group before proceeding
+    nlohmann::json chat_req = {{"@type", "getChat"}, {"chat_id", private_dice_group_id_}};
+    std::string extra_check = "checkprivate:" + std::to_string(private_dice_group_id_) + ":" + rand_token();
+    nlohmann::json chat_resp = request_with_extra_blocking(this, chat_req, extra_check, 10.0);
+    if (chat_resp.contains("@type") && chat_resp["@type"] == "error" && chat_resp.contains("message") && chat_resp["message"] == "Chat not found") {
+        logger_->error("Private group not found or bot not added");
+        append_audit("[DEBUG] Private group not found or bot not added");
+        send_event_to_gui("error", {{"detail", "Bot not added to private dice group. Please add the bot to the group as a member or admin."}});
+        return;
+    }
 
     const int MAX_ATTEMPTS = config_.value("max_attempts", 3);
     const int TOTAL = config_.value("dice_count", 10);
-    const int PER_DICE_TIMEOUT_MS = config_.value("dice_result_timeout_ms", 2000);
-    const int SEND_PACING_MS = std::max(1, dice_settings_[dice_emoji_].interval_ms);
+    const int PER_DICE_TIMEOUT_MS = config_.value("dice_result_timeout_ms", 6000);
+    const int SEND_PACING_MS = std::max(1, static_cast<int>(dice_settings_[dice_emoji_].interval_ms));
     const auto& allowed = valid_sums_.empty() ? allowed_sums_ : valid_sums_; // Use allowed sums
     bool auto_delete = config_.value("auto_delete_private_rolls", false);
 
     for (int attempt=1; attempt<=MAX_ATTEMPTS; ++attempt) {
-        logger_->info("Attempt " + std::to_string(attempt) + " rolling " + std::to_string(TOTAL) + " dice privately");
-        append_audit("Attempt " + std::to_string(attempt) + " rolling private dice");
+        logger_->info("[DEBUG] Attempt " + std::to_string(attempt) + " rolling " + std::to_string(TOTAL) + " dice privately to group " + std::to_string(private_dice_group_id_));
+        append_audit("[DEBUG] Attempt " + std::to_string(attempt) + " rolling private dice to group " + std::to_string(private_dice_group_id_));
 
-        auto msg_ids = sendDiceBatch(private_dice_group_id_, TOTAL, SEND_PACING_MS);
-        append_audit("Sent private dice count=" + std::to_string(msg_ids.size()));
+    auto dice_keys = sendDiceBatch(private_dice_group_id_, TOTAL, SEND_PACING_MS);
+    logger_->info("[DEBUG] Sent " + std::to_string(dice_keys.size()) + " dice to private group " + std::to_string(private_dice_group_id_));
+    append_audit("[DEBUG] Sent private dice count=" + std::to_string(dice_keys.size()) + " to group " + std::to_string(private_dice_group_id_));
 
-        auto vals = waitForDiceResults(private_dice_group_id_, msg_ids, PER_DICE_TIMEOUT_MS);
-        if ((int)vals.size() != TOTAL) { logger_->warn("unexpected results count"); append_audit("unexpected results count"); continue; }
-        bool any_bad=false; for (int v: vals) if (v<1 || v>6) { any_bad=true; break; }
-        if (any_bad) { logger_->warn("some dice invalid"); append_audit("some dice invalid"); continue; }
+    auto vals = waitForDiceResults(dice_keys, PER_DICE_TIMEOUT_MS);
+    // Log all 10 dice values
+    std::ostringstream dice_log;
+    dice_log << "[DEBUG] All 10 dice values: ";
+    for (int v : vals) dice_log << v << " ";
+    logger_->info(dice_log.str());
+    append_audit(dice_log.str());
 
-        std::array<int,10> arr{};
-        for (int i=0;i<TOTAL && i<10;++i) arr[i]=vals[i];
-
-        auto triple = pick_best_triple(arr); // Uses allowed sums internally
-        if (!triple.has_value()) { logger_->info("no valid triple found"); append_audit("no valid triple"); continue; }
-
-        auto [i,j,k] = triple.value();
-        int v1 = arr[i], v2 = arr[j], v3 = arr[k];
-        int sum = v1 + v2 + v3;
-        if (!allowed.empty() && !allowed.count(sum)) { // Check allowed sums
-            logger_->info("triple sum " + std::to_string(sum) + " not in allowed sums");
-            append_audit("Triple sum " + std::to_string(sum) + " not in allowed sums");
+        logger_->info("[DEBUG] Received " + std::to_string(vals.size()) + " dice results from private group " + std::to_string(private_dice_group_id_));
+        std::ostringstream dice_debug;
+        dice_debug << "[DEBUG] Dice values received: ";
+        for (int v : vals) dice_debug << v << " ";
+        logger_->info(dice_debug.str());
+        append_audit(dice_debug.str());
+        if ((int)vals.size() != TOTAL) {
+            logger_->warn("[DEBUG] unexpected results count from private group");
+            append_audit("[DEBUG] unexpected results count from private group");
             continue;
         }
+        bool any_bad = false;
+        for (int v : vals) if (v < 1 || v > 6) { any_bad = true; break; }
+        if (any_bad) {
+            logger_->warn("[DEBUG] some dice invalid in private group, but proceeding to publish sum anyway");
+            append_audit("[DEBUG] some dice invalid in private group, but proceeding to publish sum anyway");
+        }
 
-        append_audit("Picked triple indices (" + std::to_string(i) + "," + std::to_string(j) + "," + std::to_string(k) + ") values (" + std::to_string(v1)+","+std::to_string(v2)+","+std::to_string(v3)+") sum=" + std::to_string(sum));
-        logger_->info("Picked triple sum=" + std::to_string(sum));
+        // --- New pickTriple logic ---
+        struct Triple {
+            int i, j, k;
+            int s;
+            double var;
+        };
+        auto variance3 = [](int a, int b, int c) {
+            double m = (a + b + c) / 3.0;
+            return ((a - m)*(a - m) + (b - m)*(b - m) + (c - m)*(c - m)) / 3.0;
+        };
+        std::vector<Triple> all;
+        for (int i = 0; i < (int)vals.size(); ++i)
+            for (int j = i + 1; j < (int)vals.size(); ++j)
+                for (int k = j + 1; k < (int)vals.size(); ++k) {
+                    int a = vals[i], b = vals[j], c = vals[k];
+                    if (a < 1 || b < 1 || c < 1) continue;
+                    int s = a + b + c;
+                    all.push_back({i, j, k, s, variance3(a, b, c)});
+                }
+        if (all.empty()) {
+            logger_->info("[DEBUG] No valid triple found in private group (all dice invalid)");
+            append_audit("[DEBUG] No valid triple in private group (all dice invalid)");
+            send_event_to_gui("public_dice_not_allowed", nlohmann::json{{"detail", "No valid triple (all dice invalid); nothing announced to public group."}});
+            return;
+        }
+        std::vector<int> validSums(allowed.begin(), allowed.end());
+        std::sort(validSums.begin(), validSums.end());
+        auto isAllowed = [&](int s){
+            if (validSums.empty()) return true;
+            return std::binary_search(validSums.begin(), validSums.end(), s);
+        };
+        std::vector<Triple> exact;
+        if (!validSums.empty()) {
+            for (auto &t : all) if (isAllowed(t.s)) exact.push_back(t);
+        } else {
+            exact = all;
+        }
+        auto better = [](const Triple& A, const Triple& B) {
+            if (A.var != B.var) return A.var < B.var;
+            if (A.s   != B.s)   return A.s   > B.s;
+            if (A.i   != B.i)   return A.i   < B.i;
+            if (A.j   != B.j)   return A.j   < B.j;
+            return A.k < B.k;
+        };
+        std::optional<Triple> chosen;
+        if (!exact.empty()) {
+            chosen = *std::min_element(exact.begin(), exact.end(), better);
+        } else {
+            // No exact match, pick closest
+            auto distToAllowed = [&](int s){
+                int d = INT_MAX;
+                for (int v : validSums) d = std::min(d, std::abs(s - v));
+                return d;
+            };
+            const Triple* best = &all[0];
+            int bestD = distToAllowed(all[0].s);
+            for (auto &t : all) {
+                int d = distToAllowed(t.s);
+                if (d < bestD || (d == bestD && better(t, *best))) {
+                    bestD = d; best = &t;
+                }
+            }
+            chosen = *best;
+        }
+        // Logging for exact/closest match
+        if (chosen && isAllowed(chosen->s)) {
+            logger_->info(std::string("[DEBUG] Picked triple meeting valid_sums: ") +
+                std::to_string(vals[chosen->i]) + ", " + std::to_string(vals[chosen->j]) + ", " + std::to_string(vals[chosen->k]) +
+                " (sum = " + std::to_string(chosen->s) + ", var = " + std::to_string(chosen->var) + ")");
+        } else if (chosen) {
+            logger_->warn(std::string("[DEBUG] No exact valid_sums match; picked closest sum ") +
+                std::to_string(chosen->s) + " from values " +
+                std::to_string(vals[chosen->i]) + ", " + std::to_string(vals[chosen->j]) + ", " + std::to_string(vals[chosen->k]) +
+                " (var = " + std::to_string(chosen->var) + ")");
+        }
+        int v1 = vals[chosen->i], v2 = vals[chosen->j], v3 = vals[chosen->k];
+        int sum = v1 + v2 + v3;
+        append_audit("[DEBUG] Picked triple indices (" + std::to_string(chosen->i) + "," + std::to_string(chosen->j) + "," + std::to_string(chosen->k) + ") values (" + std::to_string(v1)+","+std::to_string(v2)+","+std::to_string(v3)+") sum=" + std::to_string(sum));
+        logger_->info("[DEBUG] Picked triple sum=" + std::to_string(sum) + " from private group " + std::to_string(private_dice_group_id_));
+        // End pickTriple logic
 
         for (const auto& g : public_groups_) {
+            logger_->info("[DEBUG] Attempting to send to public group id: " + std::to_string(g.id));
             if (g.id == 0) continue;
+            logger_->info("[DEBUG] Announcing best triple to public group " + std::to_string(g.id));
 
+            // 1. Send 3 dice animations that match the real best triple values
+            std::string emoji = dice_emoji_;
+            if (emoji.empty()) emoji = "🎲";
+            std::array<int, 3> triple_vals = {v1, v2, v3};
             for (int n = 0; n < 3; ++n) {
-                json req = {
+                json req_dice = {
                     {"@type","sendMessage"},
                     {"chat_id", g.id},
-                    {"input_message_content", { {"@type","inputMessageDice"}, {"emoji", dice_emoji_} }}
+                    {"input_message_content", { {"@type","inputMessageDice"}, {"emoji", emoji} }}
                 };
-                send(req.dump());
+                // Do NOT set "value" here. The real dice value will be set by Telegram and received in updateMessageContent.
+                send(req_dice.dump());
                 sleep_ms(SEND_PACING_MS);
+                nlohmann::json data = { {"group_id", g.id}, {"dice_num", n+1}, {"value", triple_vals[n]} };
+                send_event_to_gui("public_dice_sent", data);
             }
 
+            // 2. Announce the real picked values and sum in a text message
             std::ostringstream disc;
-            disc << "Best triple from developer roll: " << v1 << ", " << v2 << ", " << v3 << " (sum = " << sum << ")";
-            json req = { {"@type","sendMessage"}, {"chat_id", g.id}, {"input_message_content", { {"@type","inputMessageText"}, {"text", { {"@type","formattedText"}, {"text", disc.str()} } } } } };
-            send(req.dump());
+            disc << "🎲 Official result: " << v1 << ", " << v2 << ", " << v3 << " (sum = " << sum << ")";
+            json req_sum = { {"@type","sendMessage"}, {"chat_id", g.id}, {"input_message_content", { {"@type","inputMessageText"}, {"text", { {"@type","formattedText"}, {"text", disc.str()} } } } } };
+            send(req_sum.dump());
+
+            // Notify GUI of summary message
+            nlohmann::json summary = { {"group_id", g.id}, {"sum", sum}, {"v1", v1}, {"v2", v2}, {"v3", v3} };
+            send_event_to_gui("public_dice_summary", summary);
         }
 
         if (auto_delete) {
-            bool ok = delete_private_messages(private_dice_group_id_, msg_ids);
-            if (ok) append_audit("Auto-deleted private rolls");
-            else append_audit("Auto-delete failed");
+            // Wait 10 minutes before deleting the remaining 7 dice
+            logger_->info("[DEBUG] Waiting 10 minutes before deleting remaining private dice messages...");
+            std::this_thread::sleep_for(std::chrono::minutes(10));
+            // Delete only the 7 dice not used in the chosen triple
+            std::vector<int64_t> to_delete;
+            if (chosen) {
+                for (int idx = 0; idx < (int)dice_keys.size(); ++idx) {
+                    if (idx != chosen->i && idx != chosen->j && idx != chosen->k) {
+                        to_delete.push_back(dice_keys[idx].msg_id);
+                    }
+                }
+            }
+            bool ok = delete_private_messages(private_dice_group_id_, to_delete);
+            if (ok) append_audit("[DEBUG] Auto-deleted remaining private rolls after 10 minutes");
+            else append_audit("[DEBUG] Auto-delete failed after 10 minutes");
         }
 
-        logger_->info("Completed send_best3_dice_to_public successfully");
+        logger_->info("[DEBUG] Completed send_best3_dice_to_public successfully");
         return;
     }
 
-    logger_->warn("All attempts exhausted; failed to publish best triple");
-    append_audit("Failed to publish best triple after attempts");
+    logger_->warn("[DEBUG] All attempts exhausted; failed to publish best triple");
+    append_audit("[DEBUG] Failed to publish best triple after attempts");
 }
 
 bool TelegramSession::delete_private_messages(int64_t chat_id, const std::vector<int64_t>& message_ids) {
     if (message_ids.empty()) return true;
-    json req = { {"@type","deleteMessages"}, {"chat_id", chat_id}, {"message_ids", message_ids}, {"revoke", true} };
-    std::string extra = "del:" + std::to_string(chat_id) + ":" + rand_token();
-    json resp = request_with_extra_blocking(this, req, extra, 10.0);
-    if (!resp.is_object() || (resp.contains("@type") && resp["@type"]=="error")) {
-        logger_->warn("deleteMessages failed: " + resp.dump());
-        append_audit("deleteMessages failed: " + resp.dump());
+    try {
+        json req = { {"@type","deleteMessages"}, {"chat_id", chat_id}, {"message_ids", message_ids}, {"revoke", true} };
+        std::string extra = "del:" + std::to_string(chat_id) + ":" + rand_token();
+        json resp = request_with_extra_blocking(this, req, extra, 10.0);
+        if (!resp.is_object() || (resp.contains("@type") && resp["@type"]=="error")) {
+            if (resp.is_object() && resp.contains("code") && resp["code"] == 400) {
+                logger_->warn("deleteMessages skipped error 400: " + resp.dump());
+                append_audit("deleteMessages skipped error 400: " + resp.dump());
+                return true;
+            }
+            logger_->warn("deleteMessages failed: " + resp.dump());
+            append_audit("deleteMessages failed: " + resp.dump());
+            return false;
+        }
+        append_audit("Deleted private messages chat=" + std::to_string(chat_id) + " count=" + std::to_string(message_ids.size()));
+        return true;
+    } catch (const std::exception& e) {
+        logger_->warn(std::string("deleteMessages exception: ") + e.what());
+        append_audit(std::string("deleteMessages exception: ") + e.what());
         return false;
     }
-    append_audit("Deleted private messages chat=" + std::to_string(chat_id) + " count=" + std::to_string(message_ids.size()));
-    return true;
 }
 
 void TelegramSession::delete_message(long chat_id, long message_id) {
@@ -797,6 +1237,11 @@ json TelegramSession::copy_messages_to_public(int64_t from_chat_id, int64_t to_c
     return resp;
 }
 
+// Singleton instance for TelegramSession
+TelegramSession& TelegramSession::get_instance() {
+    static TelegramSession instance;
+    return instance;
+}
 void TelegramSession::close() { 
     stop_update_listener(); 
 #ifdef __unix__
@@ -998,6 +1443,35 @@ void TelegramSession::stop_control_server() {
 #endif
 }
 
+// List accessible group chats and check if private_dice_group_id_ is present
+void TelegramSession::list_accessible_groups() {
+    // Request a list of chats (groups, supergroups, channels)
+    nlohmann::json req = {
+        {"@type", "getChats"},
+        {"limit", 100} // Adjust as needed
+    };
+    std::string extra = "listgroups:" + rand_token();
+    nlohmann::json resp = request_with_extra_blocking(this, req, extra, 10.0);
+
+    std::vector<int64_t> group_ids;
+    if (resp.is_object() && resp.contains("chat_ids")) {
+        for (const auto& id : resp["chat_ids"]) {
+            group_ids.push_back(id.get<int64_t>());
+        }
+    }
+
+    // Check if private_dice_group_id_ is present
+    bool found = std::find(group_ids.begin(), group_ids.end(), this->private_dice_group_id_) != group_ids.end();
+
+    // Send result to GUI
+    nlohmann::json data = {
+        {"all_group_ids", group_ids},
+        {"private_dice_group_id", this->private_dice_group_id_},
+        {"private_group_accessible", found}
+    };
+    send_event_to_gui("group_list_check", data);
+}
+
 std::string TelegramSession::handle_control_command(const std::string& line) {
     try {
         json req;
@@ -1013,6 +1487,58 @@ std::string TelegramSession::handle_control_command(const std::string& line) {
                     resp["logs"] = logs;
                     return resp.dump();
                 }
+                if (cmd == "send_best3_dice_to_public" || cmd == "dice_batch") {
+                    send_best3_dice_to_public();
+                    json resp; resp["ok"] = true; resp["status"] = "dice_sent";
+                    return resp.dump();
+                }
+                if (cmd == "list_accessible_groups") {
+                    list_accessible_groups();
+                    json resp; resp["ok"] = true; resp["status"] = "groups_listed";
+                    return resp.dump();
+                }
+                if (cmd == "get_forum_info" && req.contains("group_id")) {
+                    int64_t group_id = 0;
+                    try { group_id = req["group_id"].get<int64_t>(); } catch(...) {}
+                    nlohmann::json chat_req = {
+                        {"@type", "getChat"},
+                        {"chat_id", group_id}
+                    };
+                    std::string extra = "getforum:" + std::to_string(group_id) + ":" + rand_token();
+                    nlohmann::json chat_resp = request_with_extra_blocking(this, chat_req, extra, 10.0);
+                    bool is_forum = false;
+                    int64_t default_thread_id = 0;
+                    std::string title;
+                    if (chat_resp.is_object() && chat_resp.contains("type") && chat_resp["type"].is_object()) {
+                        auto& type = chat_resp["type"];
+                        if (type.contains("@type") && type["@type"] == "chatTypeSupergroup") {
+                            if (type.contains("is_forum")) {
+                                is_forum = type["is_forum"].get<bool>();
+                            }
+                            if (type.contains("supergroup_id")) {
+                                // Optionally, can use getForumTopics to list topics
+                            }
+                        }
+                    }
+                    if (chat_resp.contains("title")) title = chat_resp["title"].get<std::string>();
+                    // For forums, the default thread is the group id itself, but you may want to use a specific topic
+                    if (is_forum) {
+                        // Try to get the default topic/thread id
+                        if (chat_resp.contains("message_thread_id")) {
+                            default_thread_id = chat_resp["message_thread_id"].get<int64_t>();
+                        } else {
+                            default_thread_id = group_id; // fallback
+                        }
+                    }
+                    nlohmann::json resp;
+                    resp["ok"] = true;
+                    resp["group_id"] = group_id;
+                    resp["is_forum"] = is_forum;
+                    resp["title"] = title;
+                    resp["default_message_thread_id"] = default_thread_id;
+                    resp["raw_chat"] = chat_resp;
+                    return resp.dump();
+                }
                 if (g_handler) g_handler->sendCommand(cmd);
                 json ok; ok["ok"]=true; return ok.dump();
             }
@@ -1024,7 +1550,7 @@ std::string TelegramSession::handle_control_command(const std::string& line) {
         json err; err["ok"]=false; err["error"]="empty_command";
         return err.dump();
     } catch (const std::exception& ex) {
-        json err; err["ok"]=false; err["error"]=std::string("exception: ")+ex.what();
+        json err; err["ok"]=false; err["error"]=std::string("exception:")+ex.what();
         return err.dump();
     } catch (...) {
         json err; err["ok"]=false; err["error"]="unknown_exception";
@@ -1032,3 +1558,26 @@ std::string TelegramSession::handle_control_command(const std::string& line) {
     }
 }
 
+// Public setters for dice config values
+void TelegramSession::set_dice_count(int count) {
+    config_["dice_count"] = count;
+}
+void TelegramSession::set_dice_result_timeout_ms(int ms) {
+    config_["dice_result_timeout_ms"] = ms;
+}
+void TelegramSession::set_auto_delete_private_rolls(bool value) {
+    config_["auto_delete_private_rolls"] = value;
+}
+void TelegramSession::set_max_attempts(int attempts) {
+    config_["max_attempts"] = attempts;
+}
+void TelegramSession::set_auto_delete_delay_ms(int ms) {
+    config_["auto_delete_delay_ms"] = ms;
+}
+// String trim implementation for TelegramSession
+std::string TelegramSession::trim(const std::string& s) {
+    size_t start = s.find_first_not_of(" \t\n\r");
+    if (start == std::string::npos) return "";
+    size_t end = s.find_last_not_of(" \t\n\r");
+    return s.substr(start, end - start + 1);
+}
