@@ -17,6 +17,8 @@
 #endif
 #include <ctime>
 using namespace std;
+// Extern declaration for GUI status function implemented in telegram_session.cpp
+extern void send_event_to_gui(const std::string& event, const nlohmann::json& payload);
 // Helper to select which dice to keep (3 indices) based on valid sums
 static std::set<int> select_indices(const std::vector<std::pair<int64_t,int>>& rolled, const std::set<int>& valid_sums) {
     std::set<int> keep;
@@ -54,45 +56,153 @@ void MessageHandler::stop() {
     running_ = false;
 }
 void MessageHandler::sendCommand(const std::string& command) {
+    // Handle custom dice commands from GUI
+    try {
+        auto j = nlohmann::json::parse(command);
+        if (j.is_object() && j.contains("command") && j["command"].is_string()) {
+            std::string cmd = j["command"];
+            if (cmd == "send_best3_dice_to_public") {
+                session_.append_audit("Received send_best3_dice_to_public from GUI");
+                std::thread([this]() {
+                    this->process_dice_roll_and_publish();
+                }).detach();
+                return;
+            }
+            if (cmd == "set_public_group_id" && j.contains("group_id")) {
+                std::string group_id = j["group_id"].get<std::string>();
+                std::cout << "[GROUP] Received set_public_group_id from GUI: " << group_id << std::endl;
+                this->set_public_group_id(group_id);
+                session_.append_audit("Set public group id from GUI: " + group_id);
+                int64_t gid = 0;
+                try { gid = std::stoll(group_id); } catch (...) { gid = 0; }
+                if (gid != 0) {
+                    std::lock_guard<std::mutex> lk(state_mutex_);
+                    if (!config_.contains("groups") || !config_["groups"].is_array()) {
+                        config_["groups"] = nlohmann::json::array();
+                    }
+                    bool found = false;
+                    for (auto& g : config_["groups"]) {
+                        if (g.contains("id")) {
+                            g["id"] = gid;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        nlohmann::json obj;
+                        obj["id"] = gid;
+                        config_["groups"].push_back(obj);
+                    }
+                }
+                send_event_to_gui("public_group_changed", { {"group_id", group_id} });
+                return;
+            }
+            // Add similar handling for other dice/group commands as needed
+        }
+    } catch (...) { /* Not a JSON command, ignore here */ }
     std::cout << "[GUI CMD] " << command << std::endl; // Log GUI command
-    if (command == "ping") {
-    std::cout << "[PING] received from GUI" << std::endl;
-    session_.append_audit("Ping received and processed");
-    return;
-}
+    // Try to parse as JSON for command dispatch
+    bool is_json = false;
+    try {
+        auto j = nlohmann::json::parse(command);
+        is_json = true;
+        if (j.is_object() && j.contains("command") && j["command"].is_string()) {
+            std::string cmd = j["command"];
+            if (cmd == "ping") {
+                std::cout << "[PING] received from GUI" << std::endl;
+                session_.append_audit("Ping received and processed");
+                return;
+            }
+            if (cmd == "dice") {
+                // Check for allowed sums in the command and update if present
+                if (j.contains("allowed") && j["allowed"].is_array()) {
+                    std::set<int> allowed_sums;
+                    for (const auto& val : j["allowed"]) {
+                        if (val.is_number_integer()) {
+                            allowed_sums.insert(val.get<int>());
+                        }
+                    }
+                    if (!allowed_sums.empty()) {
+                        std::cout << "[INFO] Updating allowed sums from GUI: ";
+                        for (int s : allowed_sums) std::cout << s << " ";
+                        std::cout << std::endl;
+                        set_allowed_sums(allowed_sums);
+                        session_.append_audit("Updated allowed sums from GUI");
+                    }
+                }
+                session_.append_audit("Processed GUI dice command (json): " + command);
+                std::thread([this]() {
+                    this->process_dice_roll_and_publish();
+                }).detach();
+                return;
+            }
+            if (cmd == "login_phone" && j.contains("phone")) {
+                std::string phone = j["phone"].get<std::string>();
+                std::cout << "[LOGIN] Received phone from GUI: " << phone << std::endl;
+                this->start_login(phone);
+                return;
+            }
+            if ((cmd == "login_code" || cmd == "submit_code") && j.contains("code")) {
+                std::string code = j["code"].get<std::string>();
+                std::cout << "[LOGIN] Received code from GUI: " << code << std::endl;
+                this->submit_code(code);
+                return;
+            }
+            if ((cmd == "login_password" || cmd == "submit_password") && j.contains("password")) {
+                std::string password = j["password"].get<std::string>();
+                std::cout << "[LOGIN] Received password from GUI." << std::endl;
+                this->submit_password(password);
+                return;
+            }
+        }
+    } catch (...) {}
 
-std::regex cmd_regex(R"(^([\x{1F3B2}-\x{1F3FF}]):(\d+):(-?\d+))",
-                     std::regex::ECMAScript | std::regex::icase | std::regex::optimize);
-std::smatch match;
-if (std::regex_match(command, match, cmd_regex)) {
-    std::string emoji = match[1];
-    int target = std::stoi(match[2]);
-    int64_t chat_id = std::stoll(match[3]);
+    if (!is_json) {
+        // Only run regex on non-JSON commands
+        std::regex cmd_regex(R"(^([\x{1F3B2}-\x{1F3FF}]):(\d+):(-?\d+))",
+                             std::regex::ECMAScript | std::regex::icase | std::regex::optimize);
+        std::smatch match;
+        if (std::regex_match(command, match, cmd_regex)) {
+            std::string emoji = match[1];
+            int target = std::stoi(match[2]);
+            int64_t chat_id = std::stoll(match[3]);
 
-    session_.append_audit("Processed GUI command: " + command); // Echo back to GUI
+            session_.append_audit("Processed GUI command: " + command); // Echo back to GUI
 
-    std::thread([=]() {
-        this->process_dice_command(emoji, target, chat_id);
-    }).detach();
-} else {
-    std::cerr << "[WARN] Invalid command format: " << command << std::endl;
-    session_.append_audit("Invalid GUI command: " + command); // Echo invalid command
-}
+            std::thread([=]() {
+                this->process_dice_command(emoji, target, chat_id);
+            }).detach();
+        } else {
+            std::cerr << "[WARN] Invalid command format: " << command << std::endl;
+            session_.append_audit("Invalid GUI command: " + command); // Echo invalid command
+        }
+    }
 }
 void MessageHandler::process_dice_command(const std::string& emoji, int target_value, int64_t chat_id) {
     const int max_attempts = 50;
     const int interval_ms = 1;
     const int per_dice_timeout_ms = 2000;
     session_.set_dice_emoji(emoji);
+
     for (int attempt = 0; attempt < max_attempts && session_.is_authorized(); ++attempt) {
         int msg_id = session_.sendDice(chat_id, 0);
-        if (msg_id == 0) continue;
+        if (msg_id == 0) {
+            send_event_to_gui("dice_send_failed", { {"chat_id", chat_id}, {"detail", "Failed to send dice to chat"} });
+            continue;
+        }
         int value = session_.waitForDiceValue(chat_id, msg_id, per_dice_timeout_ms);
-        if (value == -1) continue;
+        if (value == -1) {
+            send_event_to_gui("dice_result_timeout", { {"chat_id", chat_id}, {"detail", "No dice result for chat"} });
+            continue;
+        }
 
         std::cout << "[DEBUG] Rolled " << value << " targeting " << target_value << " in chat " << chat_id << std::endl;
+        send_event_to_gui("dice_rolled", { {"chat_id", chat_id}, {"value", value}, {"target", target_value} });
 
-        if (value == target_value) break;
+        if (value == target_value) {
+            send_event_to_gui("dice_target_success", { {"chat_id", chat_id}, {"target", target_value}, {"detail", "Matched target"} });
+            break;
+        }
 
         int delay_ms = 100;
         {
@@ -119,7 +229,7 @@ void MessageHandler::process_dynamic_dice(const std::string& emoji, const std::s
     const int per_dice_timeout_ms = 2000;
     const int dice_count = 10; // Changed from 3 to 10
     auto msg_ids = session_.sendDiceBatch(chat_id, dice_count, pacing_ms);
-    auto vals = session_.waitForDiceResults(chat_id, msg_ids, per_dice_timeout_ms);
+    auto vals = session_.waitForDiceResults(msg_ids, per_dice_timeout_ms);
     if (vals.size() != dice_count) {
         std::cerr << "[WARN] Expected " << dice_count << " dice, got " << vals.size() << std::endl; // Fallback logging
         return;
@@ -127,7 +237,7 @@ void MessageHandler::process_dynamic_dice(const std::string& emoji, const std::s
 
     std::vector<std::pair<int64_t, int>> rolled;
     for (size_t i = 0; i < msg_ids.size(); ++i) {
-        rolled.emplace_back(msg_ids[i], vals[i]);
+        rolled.emplace_back(msg_ids[i].msg_id, vals[i]);
     }
 
     auto keep = select_indices(rolled, valid_sums);
@@ -149,6 +259,11 @@ void MessageHandler::process_dynamic_dice(const std::string& emoji, const std::s
     }
 }
 void MessageHandler::process_dice_roll_and_publish() {
+    if (!session_.is_authorized()) {
+        send_event_to_gui("dice_error", nlohmann::json{{"error", "Not authorized. Please log in first."}});
+        session_.append_audit("Dice command rejected: not authorized");
+        return;
+    }
     session_.send_best3_dice_to_public();
 }
 void MessageHandler::set_public_group_id(const std::string& group_id) {
@@ -189,7 +304,7 @@ void MessageHandler::send_dice_and_delete_loop() {
             } else continue;
 
             auto msg_ids = session_.sendDiceBatch(chat_id, dice_count, pacing_ms);
-            auto vals = session_.waitForDiceResults(chat_id, msg_ids, per_dice_timeout_ms);
+            auto vals = session_.waitForDiceResults(msg_ids, per_dice_timeout_ms);
             if (vals.size() != dice_count) {
                 std::cerr << "[WARN] Expected " << dice_count << " dice, got " << vals.size() << std::endl; // Fallback logging
                 continue;
@@ -197,7 +312,7 @@ void MessageHandler::send_dice_and_delete_loop() {
 
             std::vector<std::pair<int64_t, int>> rolled;
             for (size_t i = 0; i < msg_ids.size(); ++i) {
-                rolled.emplace_back(msg_ids[i], vals[i]);
+                rolled.emplace_back(msg_ids[i].msg_id, vals[i]);
             }
 
             auto keep = select_indices(rolled, valid_sums);
@@ -345,9 +460,11 @@ void MessageHandler::set_allowed_sums(const std::set<int>& s) {
 }
 void MessageHandler::submit_code(const std::string& code) {
     session_.submit_code_async(code);
+    send_event_to_gui("auth_status", nlohmann::json{{"status", "code_submitted"}, {"detail", "Code submitted to backend"}});
 }
 void MessageHandler::submit_password(const std::string& password) {
     session_.submit_2fa_async(password);
+    send_event_to_gui("auth_status", nlohmann::json{{"status", "password_submitted"}, {"detail", "Password submitted to backend"}});
 }
 void MessageHandler::get_status(nlohmann::json& resp) {
     resp["authorized"] = session_.is_authorized();
@@ -378,5 +495,30 @@ std::optional<std::tuple<int,int,int>> MessageHandler::pick_best_triple(const st
     }
     if (found) return best_idx;
     return std::nullopt;
+}
+// Forwarding setters for dice config values
+void MessageHandler::set_dice_emoji(const std::string& emoji) {
+    session_.set_dice_emoji(emoji);
+}
+void MessageHandler::set_dice_count(int count) {
+    session_.set_dice_count(count);
+}
+void MessageHandler::set_dice_result_timeout_ms(int ms) {
+    session_.set_dice_result_timeout_ms(ms);
+}
+void MessageHandler::set_auto_delete_private_rolls(bool value) {
+    session_.set_auto_delete_private_rolls(value);
+}
+void MessageHandler::set_max_attempts(int attempts) {
+    session_.set_max_attempts(attempts);
+}
+void MessageHandler::set_auto_delete_delay_ms(int ms) {
+    session_.set_auto_delete_delay_ms(ms);
+}
+void MessageHandler::pause_dice() {
+    session_.pause_dice();
+}
+void MessageHandler::resume_dice() {
+    session_.resume_dice();
 }
 
